@@ -151,12 +151,16 @@ def retrieve_context(
 # ------------------------ ANSWERING LAYER ------------------------
 def split_sentences(text: str) -> List[str]:
     """
-    Very simple sentence splitter based on periods.
-    Good enough for a prototype + avoids external dependencies.
+    Slightly better sentence splitter:
+    - splits on '.', '!' and '?'
+    - removes very short fragments
     """
-    raw = text.replace("\n", " ")
-    parts = raw.split(".")
-    sentences = [s.strip() for s in parts if len(s.strip()) > 20]
+    text = text.replace("\n", " ")
+    separators = [".", "!", "?"]
+    for sep in separators:
+        text = text.replace(sep, ".")
+    parts = text.split(".")
+    sentences = [s.strip() for s in parts if len(s.strip()) > 25]
     return sentences
 
 
@@ -167,13 +171,14 @@ def generate_answer_from_context(
     top_n_sentences: int = 4,
 ) -> Tuple[str, List[str]]:
     """
-    Extractive "answering":
+    Improved extractive answering:
       - split selected chunks into sentences
       - embed each sentence and the question
       - compute cosine similarity
-      - pick top-N most relevant sentences as the answer
-
-    This simulates an Answering Layer without any paid LLM.
+      - pick top-N sentences that are both:
+          * highly relevant to the question
+          * not near-duplicates of each other
+      - if nothing is clearly relevant, say we don't know
     """
     full_text = "\n ".join(selected_chunks)
     sentences = split_sentences(full_text)
@@ -181,21 +186,63 @@ def generate_answer_from_context(
     if not sentences:
         return "I could not find any sentence directly related to your question.", []
 
-    q_emb = embed_texts(embedder, [question])    # (1, dim)
-    sent_embs = embed_texts(embedder, sentences) # (N, dim)
+    # Embed question and sentences
+    q_emb = embed_texts(embedder, [question])      # (1, dim)
+    sent_embs = embed_texts(embedder, sentences)   # (N, dim)
 
-    sims = np.dot(q_emb, sent_embs.T)[0]  # (N,)
+    sims = np.dot(q_emb, sent_embs.T)[0]           # (N,)
 
-    top_idx = np.argsort(-sims)[:top_n_sentences]
-    top_sentences = [sentences[i].strip() for i in top_idx]
+    # Sort sentences by similarity (desc)
+    sorted_idx = np.argsort(-sims)
+
+    # Threshold: if even the best match is low, say "not found"
+    best_sim = sims[sorted_idx[0]]
+    MIN_SIM_THRESHOLD = 0.30  # we can tune this
+
+    if best_sim < MIN_SIM_THRESHOLD:
+        return (
+            "I could not confidently answer this question from the document. "
+            "The relevant information may not be present or is only loosely related.",
+            [],
+        )
+
+    # Select top-N sentences with diversity (no near-duplicates)
+    selected_sentences: List[str] = []
+    selected_vectors: List[np.ndarray] = []
+
+    MAX_SENTENCES = max(1, top_n_sentences)
+
+    for idx in sorted_idx:
+        if len(selected_sentences) >= MAX_SENTENCES:
+            break
+
+        candidate = sentences[idx].strip()
+        cand_vec = sent_embs[idx]
+
+        # Check similarity to already selected sentences (to avoid duplicates)
+        is_duplicate = False
+        for vec in selected_vectors:
+            sim_to_selected = float(np.dot(cand_vec, vec))
+            if sim_to_selected > 0.9:  # nearly identical sentence
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            selected_sentences.append(candidate)
+            selected_vectors.append(cand_vec)
+
+    if not selected_sentences:
+        # Fallback: at least the single best one
+        best_idx = int(sorted_idx[0])
+        selected_sentences = [sentences[best_idx].strip()]
 
     answer_text = (
         f"**Question:** {question}\n\n"
         f"**Most relevant sentences found in the document:**\n\n"
-        + "\n\n".join(f"- {s}" for s in top_sentences)
+        + "\n\n".join(f"- {s}" for s in selected_sentences)
     )
 
-    return answer_text, top_sentences
+    return answer_text, selected_sentences
 
 
 # ------------------------ STREAMLIT UI ------------------------
@@ -293,7 +340,7 @@ def main():
             overlap=overlap,
         )
 
-    st.success(f"Document processed successfully.")
+    st.success("Document processed successfully.")
     st.write(f"- Pages: **{num_pages}**")
     st.write(f"- Approx. words: **{num_words}**")
     st.write(f"- Number of chunks: **{len(chunks)}**")
@@ -349,4 +396,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
