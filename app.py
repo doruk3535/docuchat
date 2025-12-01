@@ -305,7 +305,7 @@ def main():
             value=4,
         )
 
-    st.title("DocuChat – Chat with Your PDF (Free, No API Key)")
+    st.title("DocuChat – Chat with Your PDF (Demo Version)")
 
     st.markdown(
         """
