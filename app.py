@@ -7,36 +7,46 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 
-# -----------------------------------
-# ÜCRETSİZ DOCUCHAT
-# - OpenAI / API KEY YOK
-# - Embedding: all-MiniLM-L6-v2 (sentence-transformers)
-# - Retrieval: FAISS (cosine similarity)
-# - Answer: En alakalı cümlelerden extractive özet
-# -----------------------------------
+# ------------------------------------------------------
+# DocuChat – Free RAG-Style PDF QA (No OpenAI, English UI)
+#
+# Architecture alignment:
+# - User Interface Layer: Streamlit web app
+# - Document Processing Layer: PDF parsing, cleaning, chunking
+# - Processing & Retrieval Layer: embeddings + FAISS vector search
+# - Answering Layer: sentence-level semantic retrieval (extractive)
+# ------------------------------------------------------
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
+# ------------- MODEL LOADING (shared across sessions) -------------
 @st.cache_resource
-def load_embedder():
-    """SentenceTransformer modelini bir kez yükleyip cache'ler."""
+def load_embedder() -> SentenceTransformer:
+    """Load the sentence-transformers model once and reuse it."""
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 
-# -------------------------
-# DOCUMENT PROCESSING LAYER
-# -------------------------
-def parse_pdf(file) -> str:
-    reader = PyPDF2.PdfReader(file)
+# ------------------------ DOCUMENT PROCESSING ------------------------
+def parse_pdf(file_bytes: bytes) -> Tuple[str, int]:
+    """
+    Extract raw text and number of pages from a PDF.
+    """
+    pdf_io = io.BytesIO(file_bytes)
+    reader = PyPDF2.PdfReader(pdf_io)
     pages = []
     for page in reader.pages:
         text = page.extract_text() or ""
         pages.append(text)
-    return "\n".join(pages)
+    full_text = "\n".join(pages)
+    num_pages = len(reader.pages)
+    return full_text, num_pages
 
 
 def clean_text(text: str) -> str:
+    """
+    Simple cleaning: strip whitespace, remove empty lines, normalize spaces.
+    """
     lines = [line.strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
     cleaned = " ".join(lines)
@@ -45,8 +55,12 @@ def clean_text(text: str) -> str:
 
 
 def chunk_text(text: str, max_tokens: int = 800, overlap: int = 100) -> List[str]:
+    """
+    Split the document into overlapping chunks.
+    Here "tokens" ~ words (approximation is fine for our use case).
+    """
     words = text.split()
-    chunks = []
+    chunks: List[str] = []
     start = 0
     while start < len(words):
         end = start + max_tokens
@@ -56,14 +70,11 @@ def chunk_text(text: str, max_tokens: int = 800, overlap: int = 100) -> List[str
     return chunks
 
 
-# -------------------------
-# VECTOR SEARCH LAYER
-# (Embedding + FAISS Index)
-# -------------------------
+# ------------------------ EMBEDDINGS + FAISS ------------------------
 def embed_texts(embedder: SentenceTransformer, texts: List[str]) -> np.ndarray:
     """
-    sentence-transformers ile embedding üretir ve
-    cosine similarity için vektörleri normalize eder.
+    Compute sentence-transformer embeddings and L2-normalize them
+    so cosine similarity can be approximated by inner product.
     """
     emb = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False)
     norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-10
@@ -72,10 +83,49 @@ def embed_texts(embedder: SentenceTransformer, texts: List[str]) -> np.ndarray:
 
 
 def build_faiss_index(vectors: np.ndarray) -> faiss.IndexFlatIP:
+    """
+    Build a FAISS index using inner product (cosine similarity on normalized vectors).
+    """
     dim = vectors.shape[1]
-    index = faiss.IndexFlatIP(dim)  # normalize vektörlerle cosine ~ inner product
+    index = faiss.IndexFlatIP(dim)
     index.add(vectors)
     return index
+
+
+@st.cache_data(show_spinner=False)
+def process_document(
+    file_bytes: bytes,
+    chunk_size: int,
+    overlap: int,
+    max_chunks: int = 100,
+) -> Tuple[List[str], faiss.IndexFlatIP, int, int]:
+    """
+    End-to-end document processing:
+    - parse PDF
+    - clean text
+    - chunk
+    - embed chunks
+    - build FAISS index
+
+    Returns:
+      chunks, index, num_pages, num_words
+    """
+    embedder = load_embedder()
+
+    raw_text, num_pages = parse_pdf(file_bytes)
+    cleaned = clean_text(raw_text)
+    num_words = len(cleaned.split())
+
+    chunks = chunk_text(cleaned, max_tokens=chunk_size, overlap=overlap)
+
+    # Limit number of chunks for performance on very large PDFs
+    if len(chunks) > max_chunks:
+        chunks = chunks[:max_chunks]
+
+    vectors = embed_texts(embedder, chunks)
+    index = build_faiss_index(vectors)
+
+    return chunks, index, num_pages, num_words
 
 
 def retrieve_context(
@@ -86,11 +136,10 @@ def retrieve_context(
     k: int = 4,
 ) -> Tuple[str, np.ndarray, List[str]]:
     """
-    Soru embedding'i ile en benzer k chunk'ı bulur.
-    Döndürdükleri:
-      - context_text: Seçilen chunk'ların birleşimi
-      - scores: FAISS skorları
-      - selected_chunks: Tek tek chunk listesi
+    Given a user question:
+      - embed the question
+      - retrieve top-k most similar chunks from FAISS
+      - return combined context, scores, and individual selected chunks
     """
     q_emb = embed_texts(embedder, [question])  # (1, dim)
     scores, indices = index.search(q_emb, k)
@@ -99,13 +148,11 @@ def retrieve_context(
     return context_text, scores[0], selected_chunks
 
 
-# -------------------------
-# ANSWER GENERATION (LOCAL)
-# -------------------------
+# ------------------------ ANSWERING LAYER ------------------------
 def split_sentences(text: str) -> List[str]:
     """
-    Çok basit cümle bölücü; ödev için yeterli.
-    İstersen noktaya göre böler, kısa parçaları filtreler.
+    Very simple sentence splitter based on periods.
+    Good enough for a prototype + avoids external dependencies.
     """
     raw = text.replace("\n", " ")
     parts = raw.split(".")
@@ -113,155 +160,193 @@ def split_sentences(text: str) -> List[str]:
     return sentences
 
 
-def simple_answer_from_context(
+def generate_answer_from_context(
     embedder: SentenceTransformer,
     question: str,
     selected_chunks: List[str],
     top_n_sentences: int = 4,
 ) -> Tuple[str, List[str]]:
     """
-    - Seçilen chunk'lardaki cümleleri çıkarır
-    - Her cümleyi ve soruyu embed eder
-    - Soruyla en benzer top-N cümleyi seçer
-    - Bunları "cevap" olarak döner.
+    Extractive "answering":
+      - split selected chunks into sentences
+      - embed each sentence and the question
+      - compute cosine similarity
+      - pick top-N most relevant sentences as the answer
+
+    This simulates an Answering Layer without any paid LLM.
     """
     full_text = "\n ".join(selected_chunks)
     sentences = split_sentences(full_text)
 
     if not sentences:
-        return "Belgede bu soruyla doğrudan ilgili bir cümle bulamadım.", []
+        return "I could not find any sentence directly related to your question.", []
 
-    # Soru + cümleler için embedding
-    q_emb = embed_texts(embedder, [question])  # (1, dim)
-    sent_embs = embed_texts(embedder, sentences)  # (N, dim)
+    q_emb = embed_texts(embedder, [question])    # (1, dim)
+    sent_embs = embed_texts(embedder, sentences) # (N, dim)
 
-    # Cosine similarity (iç çarpım, vektörler normalize)
     sims = np.dot(q_emb, sent_embs.T)[0]  # (N,)
 
-    # En benzer top-N cümleyi seç
     top_idx = np.argsort(-sims)[:top_n_sentences]
     top_sentences = [sentences[i].strip() for i in top_idx]
 
     answer_text = (
-        f"Sorun: {question}\n\n"
-        "Belgeden otomatik olarak seçilen en ilgili cümleler:\n\n"
+        f"**Question:** {question}\n\n"
+        f"**Most relevant sentences found in the document:**\n\n"
         + "\n\n".join(f"- {s}" for s in top_sentences)
     )
 
     return answer_text, top_sentences
 
 
-# -------------------------
-# STREAMLIT UI (USER INTERFACE LAYER)
-# -------------------------
+# ------------------------ STREAMLIT UI ------------------------
 def main():
-    st.set_page_config(page_title="DocuChat (Free RAG)", layout="wide")
+    st.set_page_config(page_title="DocuChat – Free RAG", layout="wide")
 
-    # Sidebar: Architecture overview
+    embedder = load_embedder()
+
+    # Sidebar – architecture + controls
     with st.sidebar:
-        st.title("Architecture")
+        st.title("DocuChat – Architecture")
+
+        st.markdown("### Layers")
         st.markdown("**User Interface Layer**")
-        st.caption("Streamlit web app: PDF yükleme + soru input")
+        st.caption("Streamlit web app: file upload, question input, answer display.")
+
         st.markdown("**Document Processing Layer**")
-        st.caption("PyPDF2 ile parse, cleaning, chunking")
-        st.markdown("**Vector Search Layer**")
-        st.caption("SentenceTransformer embeddings + FAISS index")
-        st.markdown("**Answering Layer (Local)**")
-        st.caption("Soru–cümle benzerliği ile extractive özet")
+        st.caption("PDF parsing, text cleaning, chunking.")
+
+        st.markdown("**Processing & Retrieval Layer**")
+        st.caption("Sentence embeddings + FAISS vector search.")
+
+        st.markdown("**Answering Layer**")
+        st.caption("Semantic sentence ranking (extractive answer).")
 
         st.markdown("---")
-        st.markdown("**Model:** `all-MiniLM-L6-v2`")
-        st.markdown("**Index:** FAISS (Inner Product)")
+        st.markdown("### Model & Index")
+        st.write(f"Embedding model: `{EMBEDDING_MODEL_NAME}`")
+        st.write("Vector index: FAISS (Inner Product, cosine on normalized vectors)")
 
-    st.title("DocuChat – PDF ile Sohbet (Ücretsiz RAG Sürümü)")
+        st.markdown("---")
+        st.markdown("### Retrieval Settings")
+
+        chunk_size = st.slider(
+            "Chunk size (words)",
+            min_value=200,
+            max_value=1200,
+            step=100,
+            value=800,
+        )
+        overlap = st.slider(
+            "Chunk overlap (words)",
+            min_value=0,
+            max_value=400,
+            step=50,
+            value=100,
+        )
+        k_chunks = st.slider(
+            "Top-k chunks to retrieve",
+            min_value=1,
+            max_value=10,
+            step=1,
+            value=4,
+        )
+        top_n_sentences = st.slider(
+            "Top-N sentences for the answer",
+            min_value=1,
+            max_value=10,
+            step=1,
+            value=4,
+        )
+
+    st.title("DocuChat – Chat with Your PDF (Free, No API Key)")
 
     st.markdown(
         """
-        Bu sürümde **OpenAI API kullanılmıyor**.  
-        Tüm işlem local modellerle ve FAISS ile yapılıyor:
-        1. PDF'ten metin çıkarma ve temizleme  
-        2. Metni anlamlı parçalara (chunk) ayırma  
-        3. Her chunk için embedding üretme  
-        4. Soruya en benzeyen chunk'lardaki cümleleri seçip cevaplama  
+        This prototype implements a **RAG-style pipeline without any paid APIs**.  
+        The system:
+        1. Extracts and cleans text from the uploaded PDF  
+        2. Splits it into overlapping **chunks**  
+        3. Creates **semantic embeddings** of each chunk  
+        4. Uses **FAISS** to retrieve the most relevant chunks for your question  
+        5. Ranks individual sentences inside those chunks to build an **extractive answer**  
         """
     )
 
     if "history" not in st.session_state:
-        st.session_state.history = []  # (question, answer, context)
+        # question, answer, context, scores, top_sentences
+        st.session_state.history: List[Tuple[str, str, str, np.ndarray, List[str]]] = []
 
-    uploaded_file = st.file_uploader("PDF dosyası yükle", type=["pdf"])
+    uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
 
     if uploaded_file is None:
-        st.info("Başlamak için bir PDF yükleyin.")
+        st.info("To get started, please upload a PDF file.")
         return
 
-    embedder = load_embedder()
+    # Read file bytes once
+    file_bytes = uploaded_file.read()
 
-    # PDF ilk kez yüklendiğinde işleme
-    if "chunks" not in st.session_state:
-        with st.spinner("PDF okunuyor ve işleniyor..."):
-            pdf_bytes = io.BytesIO(uploaded_file.read())
-            raw_text = parse_pdf(pdf_bytes)
-            cleaned = clean_text(raw_text)
-            chunks = chunk_text(cleaned, max_tokens=800, overlap=100)
+    # Process document (cached by bytes + settings)
+    with st.spinner("Processing document (parsing, chunking, embeddings, FAISS index)..."):
+        chunks, index, num_pages, num_words = process_document(
+            file_bytes=file_bytes,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
 
-            # Çok büyük dosyalarda maliyeti azaltmak için chunk sayısını sınırla
-            MAX_CHUNKS = 80
-            if len(chunks) > MAX_CHUNKS:
-                chunks = chunks[:MAX_CHUNKS]
+    st.success(f"Document processed successfully.")
+    st.write(f"- Pages: **{num_pages}**")
+    st.write(f"- Approx. words: **{num_words}**")
+    st.write(f"- Number of chunks: **{len(chunks)}**")
 
-            vectors = embed_texts(embedder, chunks)
-            index = build_faiss_index(vectors)
+    st.markdown("---")
 
-            st.session_state.chunks = chunks
-            st.session_state.index = index
-
-        st.success(f"Belge işlendi. Chunk sayısı: {len(st.session_state.chunks)}")
-
-    # Layout: Soru solda, sonuçlar aşağıda
-    question = st.text_input("Belge hakkında bir soru sor:")
+    question = st.text_input("Ask a question about this document:")
 
     if question:
-        with st.spinner("İlgili context ve cümleler aranıyor..."):
+        with st.spinner("Retrieving relevant chunks and building an answer..."):
             context, scores, selected_chunks = retrieve_context(
                 embedder,
                 question,
-                st.session_state.chunks,
-                st.session_state.index,
-                k=4,
+                chunks,
+                index,
+                k=k_chunks,
             )
-            answer, top_sentences = simple_answer_from_context(
+
+            answer, top_sentences = generate_answer_from_context(
                 embedder,
                 question,
                 selected_chunks,
+                top_n_sentences=top_n_sentences,
             )
 
-        st.session_state.history.append((question, answer, context, scores, top_sentences))
+        st.session_state.history.append(
+            (question, answer, context, scores, top_sentences)
+        )
 
-    # Geçmişi göster
+    # Show answer & history
     if st.session_state.history:
-        st.subheader("Soru–Cevap Geçmişi")
+        st.subheader("Question–Answer History")
+
         for q, a, _, _, _ in reversed(st.session_state.history):
-            st.markdown(f"**Soru:** {q}")
-            st.markdown("**Cevap:**")
+            st.markdown(f"**Q:** {q}")
             st.markdown(a)
             st.markdown("---")
 
-    # Son sorunun context'i ve skorları
-    if st.session_state.history:
+        # Last interaction details
         last_q, last_a, last_ctx, last_scores, last_top_sents = st.session_state.history[-1]
 
-        with st.expander("Son soru için kullanılan context ve skorlar"):
-            st.markdown("**Top-k chunk skorları (FAISS inner product):**")
+        with st.expander("Details: retrieved chunks and similarity scores"):
+            st.markdown("**FAISS similarity scores for the last question (higher = more relevant):**")
             st.write(last_scores)
             st.markdown("---")
-            st.markdown("**Context (birleştirilmiş chunk'lar):**")
+            st.markdown("**Combined retrieved context (all selected chunks):**")
             st.write(last_ctx)
 
-        with st.expander("Son soruda seçilen en ilgili cümleler"):
+        with st.expander("Details: top-ranked sentences used in the answer"):
             for s in last_top_sents:
                 st.markdown(f"- {s}")
 
 
 if __name__ == "__main__":
     main()
+
