@@ -6,15 +6,18 @@ import PyPDF2
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
+from sklearn.cluster import KMeans
 
 # ------------------------------------------------------
-# DocuChat – Free RAG-Style PDF QA (No OpenAI, English UI)
+# DocuChat – Free RAG-Style PDF QA + Summarization
+# (No OpenAI, English UI but works with Turkish/English PDFs)
 #
-# Architecture alignment:
+# Layers:
 # - User Interface Layer: Streamlit web app
 # - Document Processing Layer: PDF parsing, cleaning, chunking
 # - Processing & Retrieval Layer: embeddings + FAISS vector search
-# - Answering Layer: sentence-level semantic retrieval (extractive)
+# - Answering Layer: sentence-level semantic ranking (extractive QA)
+# - Summarization Layer: sentence embeddings + KMeans clustering
 # ------------------------------------------------------
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -98,7 +101,7 @@ def process_document(
     chunk_size: int,
     overlap: int,
     max_chunks: int = 100,
-) -> Tuple[List[str], faiss.IndexFlatIP, int, int]:
+) -> Tuple[List[str], faiss.IndexFlatIP, int, int, str]:
     """
     End-to-end document processing:
     - parse PDF
@@ -108,7 +111,7 @@ def process_document(
     - build FAISS index
 
     Returns:
-      chunks, index, num_pages, num_words
+      chunks, index, num_pages, num_words, cleaned_text
     """
     embedder = load_embedder()
 
@@ -125,7 +128,7 @@ def process_document(
     vectors = embed_texts(embedder, chunks)
     index = build_faiss_index(vectors)
 
-    return chunks, index, num_pages, num_words
+    return chunks, index, num_pages, num_words, cleaned
 
 
 def retrieve_context(
@@ -148,12 +151,13 @@ def retrieve_context(
     return context_text, scores[0], selected_chunks
 
 
-# ------------------------ ANSWERING LAYER ------------------------
+# ------------------------ SENTENCE SPLITTING ------------------------
 def split_sentences(text: str) -> List[str]:
     """
     Slightly better sentence splitter:
     - splits on '.', '!' and '?'
     - removes very short fragments
+    Works fine for both Turkish and English.
     """
     text = text.replace("\n", " ")
     separators = [".", "!", "?"]
@@ -164,6 +168,7 @@ def split_sentences(text: str) -> List[str]:
     return sentences
 
 
+# ------------------------ QA ANSWERING LAYER ------------------------
 def generate_answer_from_context(
     embedder: SentenceTransformer,
     question: str,
@@ -197,7 +202,7 @@ def generate_answer_from_context(
 
     # Threshold: if even the best match is low, say "not found"
     best_sim = sims[sorted_idx[0]]
-    MIN_SIM_THRESHOLD = 0.30  # we can tune this
+    MIN_SIM_THRESHOLD = 0.30
 
     if best_sim < MIN_SIM_THRESHOLD:
         return (
@@ -245,6 +250,60 @@ def generate_answer_from_context(
     return answer_text, selected_sentences
 
 
+# ------------------------ SUMMARIZATION LAYER ------------------------
+def summarize_document(
+    embedder: SentenceTransformer,
+    cleaned_text: str,
+    num_summary_sentences: int = 6,
+) -> str:
+    """
+    Smart extractive summarization:
+      - split whole document into sentences
+      - embed all sentences
+      - cluster with KMeans
+      - pick one representative sentence per cluster
+      - order them by original position and join as a coherent summary
+    """
+    sentences = split_sentences(cleaned_text)
+    if not sentences:
+        return "I could not extract any sentences from this document."
+
+    if len(sentences) <= num_summary_sentences:
+        return " ".join(sentences)
+
+    # Embed all sentences
+    sent_embs = embed_texts(embedder, sentences)
+
+    k = min(num_summary_sentences, sent_embs.shape[0])
+    if k <= 1:
+        return sentences[0]
+
+    kmeans = KMeans(n_clusters=k, n_init=5, random_state=42)
+    kmeans.fit(sent_embs)
+    centers = kmeans.cluster_centers_
+
+    selected_idx: List[int] = []
+
+    for ci in range(k):
+        cluster_indices = np.where(kmeans.labels_ == ci)[0]
+        if len(cluster_indices) == 0:
+            continue
+        cluster_vectors = sent_embs[cluster_indices]
+        center = centers[ci]
+        sims = np.dot(cluster_vectors, center)
+        best_local = cluster_indices[int(np.argmax(sims))]
+        selected_idx.append(best_local)
+
+    # Sıralı ve benzersiz indeksler
+    selected_idx = sorted(set(selected_idx))
+    selected_idx = selected_idx[:num_summary_sentences]
+
+    summary_sentences = [sentences[i] for i in selected_idx]
+    summary_text = " ".join(summary_sentences)
+
+    return "In summary, " + summary_text
+
+
 # ------------------------ STREAMLIT UI ------------------------
 def main():
     st.set_page_config(page_title="DocuChat – Free RAG", layout="wide")
@@ -254,6 +313,13 @@ def main():
     # Sidebar – architecture + controls
     with st.sidebar:
         st.title("DocuChat – Architecture")
+
+        st.markdown("### Mode")
+        mode = st.radio(
+            "Choose mode",
+            ["Question Answering", "Document Summarization"],
+            index=0,
+        )
 
         st.markdown("### Layers")
         st.markdown("**User Interface Layer**")
@@ -266,7 +332,10 @@ def main():
         st.caption("Sentence embeddings + FAISS vector search.")
 
         st.markdown("**Answering Layer**")
-        st.caption("Semantic sentence ranking (extractive answer).")
+        st.caption("Semantic sentence ranking (extractive answer for QA).")
+
+        st.markdown("**Summarization Layer**")
+        st.caption("Sentence embeddings + KMeans clustering to build a global summary.")
 
         st.markdown("---")
         st.markdown("### Model & Index")
@@ -274,7 +343,7 @@ def main():
         st.write("Vector index: FAISS (Inner Product, cosine on normalized vectors)")
 
         st.markdown("---")
-        st.markdown("### Retrieval Settings")
+        st.markdown("### Retrieval Settings (for QA)")
 
         chunk_size = st.slider(
             "Chunk size (words)",
@@ -305,17 +374,28 @@ def main():
             value=4,
         )
 
-    st.title("DocuChat – Chat with Your PDF (Demo Version)")
+        st.markdown("---")
+        st.markdown("### Summarization Settings")
+        summary_sentences = st.slider(
+            "Number of sentences in summary",
+            min_value=3,
+            max_value=10,
+            step=1,
+            value=6,
+        )
+
+    st.title("DocuChat – Chat with Your PDF (Free, No API Key)")
 
     st.markdown(
         """
         This prototype implements a **RAG-style pipeline without any paid APIs**.  
-        The system:
-        1. Extracts and cleans text from the uploaded PDF  
-        2. Splits it into overlapping **chunks**  
-        3. Creates **semantic embeddings** of each chunk  
-        4. Uses **FAISS** to retrieve the most relevant chunks for your question  
-        5. Ranks individual sentences inside those chunks to build an **extractive answer**  
+        You can use it in two modes:
+
+        - **Question Answering:** Ask questions about the PDF and get relevant sentences.  
+        - **Document Summarization:** Generate a smart, global summary of the whole PDF.  
+
+        Under the hood it uses sentence embeddings, FAISS vector search and KMeans-based
+        summarization, so it really behaves like an intelligent AI system.
         """
     )
 
@@ -334,7 +414,7 @@ def main():
 
     # Process document (cached by bytes + settings)
     with st.spinner("Processing document (parsing, chunking, embeddings, FAISS index)..."):
-        chunks, index, num_pages, num_words = process_document(
+        chunks, index, num_pages, num_words, cleaned_text = process_document(
             file_bytes=file_bytes,
             chunk_size=chunk_size,
             overlap=overlap,
@@ -347,54 +427,72 @@ def main():
 
     st.markdown("---")
 
-    question = st.text_input("Ask a question about this document:")
+    # ----------------- MODE 1: QUESTION ANSWERING -----------------
+    if mode == "Question Answering":
+        question = st.text_input("Ask a question about this document:")
 
-    if question:
-        with st.spinner("Retrieving relevant chunks and building an answer..."):
-            context, scores, selected_chunks = retrieve_context(
-                embedder,
-                question,
-                chunks,
-                index,
-                k=k_chunks,
+        if question:
+            with st.spinner("Retrieving relevant chunks and building an answer..."):
+                context, scores, selected_chunks = retrieve_context(
+                    embedder,
+                    question,
+                    chunks,
+                    index,
+                    k=k_chunks,
+                )
+
+                answer, top_sentences = generate_answer_from_context(
+                    embedder,
+                    question,
+                    selected_chunks,
+                    top_n_sentences=top_n_sentences,
+                )
+
+            st.session_state.history.append(
+                (question, answer, context, scores, top_sentences)
             )
 
-            answer, top_sentences = generate_answer_from_context(
-                embedder,
-                question,
-                selected_chunks,
-                top_n_sentences=top_n_sentences,
-            )
+        # Show answer & history
+        if st.session_state.history:
+            st.subheader("Question–Answer History")
 
-        st.session_state.history.append(
-            (question, answer, context, scores, top_sentences)
-        )
+            for q, a, _, _, _ in reversed(st.session_state.history):
+                st.markdown(f"**Q:** {q}")
+                st.markdown(a)
+                st.markdown("---")
 
-    # Show answer & history
-    if st.session_state.history:
-        st.subheader("Question–Answer History")
+            # Last interaction details
+            last_q, last_a, last_ctx, last_scores, last_top_sents = st.session_state.history[-1]
 
-        for q, a, _, _, _ in reversed(st.session_state.history):
-            st.markdown(f"**Q:** {q}")
-            st.markdown(a)
-            st.markdown("---")
+            with st.expander("Details: retrieved chunks and similarity scores"):
+                st.markdown("**FAISS similarity scores for the last question (higher = more relevant):**")
+                st.write(last_scores)
+                st.markdown("---")
+                st.markdown("**Combined retrieved context (all selected chunks):**")
+                st.write(last_ctx)
 
-        # Last interaction details
-        last_q, last_a, last_ctx, last_scores, last_top_sents = st.session_state.history[-1]
+            with st.expander("Details: top-ranked sentences used in the answer"):
+                for s in last_top_sents:
+                    st.markdown(f"- {s}")
 
-        with st.expander("Details: retrieved chunks and similarity scores"):
-            st.markdown("**FAISS similarity scores for the last question (higher = more relevant):**")
-            st.write(last_scores)
-            st.markdown("---")
-            st.markdown("**Combined retrieved context (all selected chunks):**")
-            st.write(last_ctx)
+    # ----------------- MODE 2: DOCUMENT SUMMARIZATION -----------------
+    else:
+        st.subheader("Document Summarization")
 
-        with st.expander("Details: top-ranked sentences used in the answer"):
-            for s in last_top_sents:
-                st.markdown(f"- {s}")
+        if st.button("Generate summary"):
+            with st.spinner("Generating smart summary of the document..."):
+                summary = summarize_document(
+                    embedder,
+                    cleaned_text,
+                    num_summary_sentences=summary_sentences,
+                )
+
+            st.markdown("### Summary")
+            st.write(summary)
 
 
 if __name__ == "__main__":
     main()
+
 
 
