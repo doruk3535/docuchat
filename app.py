@@ -26,8 +26,8 @@ import plotly.express as px
 # ==============================================================================
 
 st.set_page_config(
-    page_title="DocuChat Enterprise Demo",
-    page_icon="🧠",
+    page_title="DocuChat Demo",
+    page_icon="📝",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
