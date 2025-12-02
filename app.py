@@ -635,7 +635,7 @@ def main() -> None:
 
     chunk_size, overlap, top_k, strict_mode = render_sidebar()
 
-    st.title("🧠 DocuChat Enterprise Demo")
+    st.title("📝 DocuChat Demo")
     st.caption(
         "Local Retrieval-Augmented Generation system for PDF document analysis."
     )
