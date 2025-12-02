@@ -362,24 +362,24 @@ def main():
         )
 
         st.markdown("### Layers")
-        st.markdown("*User Interface Layer*")
+        st.markdown("**User Interface Layer**")
         st.caption("Streamlit web app: file upload, question input, answer display.")
 
-        st.markdown("*Document Processing Layer*")
+        st.markdown("**Document Processing Layer**")
         st.caption("PDF parsing, text cleaning, chunking.")
 
-        st.markdown("*Processing & Retrieval Layer*")
+        st.markdown("**Processing & Retrieval Layer**")
         st.caption("Sentence embeddings + FAISS vector search.")
 
-        st.markdown("*Answering Layer*")
+        st.markdown("**Answering Layer**")
         st.caption("Semantic sentence ranking + lightweight rewrite for QA.")
 
-        st.markdown("*Summarization Layer*")
+        st.markdown("**Summarization Layer**")
         st.caption("Sentence embeddings + KMeans clustering to build a global summary.")
 
         st.markdown("---")
         st.markdown("### Model & Index")
-        st.write(f"Embedding model: {EMBEDDING_MODEL_NAME}")
+        st.write(f"Embedding model: `{EMBEDDING_MODEL_NAME}`")
         st.write("Vector index: FAISS (Inner Product, cosine on normalized vectors)")
 
         st.markdown("---")
@@ -428,11 +428,11 @@ def main():
 
     st.markdown(
         """
-        This prototype implements a *RAG-style pipeline without any paid APIs*.  
+        This prototype implements a **RAG-style pipeline without any paid APIs**.  
         You can use it in two modes:
 
-        - *Question Answering:* Ask questions about the PDF and get rewritten, human-like answers.  
-        - *Document Summarization:* Generate a smart, global summary of the whole PDF.  
+        - **Question Answering:** Ask questions about the PDF and get *rewritten*, human-like answers.  
+        - **Document Summarization:** Generate a smart, global summary of the whole PDF.  
 
         Under the hood it uses sentence embeddings, FAISS vector search and KMeans-based
         summarization, plus a lightweight rewrite step to behave more like an intelligent AI system.
@@ -461,9 +461,9 @@ def main():
         )
 
     st.success("Document processed successfully.")
-    st.write(f"- Pages: *{num_pages}*")
-    st.write(f"- Approx. words: *{num_words}*")
-    st.write(f"- Number of chunks: *{len(chunks)}*")
+    st.write(f"- Pages: **{num_pages}**")
+    st.write(f"- Approx. words: **{num_words}**")
+    st.write(f"- Number of chunks: **{len(chunks)}**")
 
     st.markdown("---")
 
@@ -497,7 +497,7 @@ def main():
             st.subheader("Question–Answer History")
 
             for q, a, _, _, _ in reversed(st.session_state.history):
-                st.markdown(f"*Q:* {q}")
+                st.markdown(f"**Q:** {q}")
                 st.markdown(a)
                 st.markdown("---")
 
@@ -505,10 +505,10 @@ def main():
             last_q, last_a, last_ctx, last_scores, last_top_sents = st.session_state.history[-1]
 
             with st.expander("Details: retrieved chunks and similarity scores"):
-                st.markdown("*FAISS similarity scores for the last question (higher = more relevant):*")
+                st.markdown("**FAISS similarity scores for the last question (higher = more relevant):**")
                 st.write(last_scores)
                 st.markdown("---")
-                st.markdown("*Combined retrieved context (all selected chunks):*")
+                st.markdown("**Combined retrieved context (all selected chunks):**")
                 st.write(last_ctx)
 
             with st.expander("Details: top-ranked sentences fed into the rewrite step"):
@@ -531,5 +531,5 @@ def main():
             st.write(summary)
 
 
-if _name_ == "_main_":
-    main()
+if __name__ == "__main__":
+    main()
