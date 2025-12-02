@@ -1,12 +1,8 @@
 """
-DocuChat Enterprise Edition
----------------------------
-A local, secure, and robust RAG (Retrieval-Augmented Generation) system 
-designed for high-volume document analysis without external API dependencies.
-
-Author: DocuChat Team
-Version: 3.5.0 (Release Candidate)
-License: MIT
+DocuChat Enterprise Edition (Demo)
+----------------------------------
+Local, secure RAG system for PDF question-answering.
+This is a demo version for course presentation.
 """
 
 import io
@@ -30,14 +26,12 @@ import plotly.express as px
 # ==============================================================================
 
 st.set_page_config(
-    page_title="DocuChat Enterprise System",
-    page_icon="🏢",
+    page_title="DocuChat Enterprise Demo",
+    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
-        "Get Help": "https://github.com/streamlit",
-        "Report a bug": "https://github.com/streamlit",
-        "About": "# DocuChat Enterprise\nLocal RAG System v3.5",
+        "About": "# DocuChat Enterprise Demo\nLocal RAG System v3.5",
     },
 )
 
@@ -80,45 +74,46 @@ if "sys_logger" not in st.session_state:
 
 logger: SystemLogger = st.session_state.sys_logger
 
-# Custom CSS for Professional Look
+# Custom CSS
 st.markdown(
     """
 <style>
+    /* Main area */
     .main {
-        background-color: #f8f9fa;
+        background-color: #0f172a;
         font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        color: #e5e7eb;
     }
-    h1 { color: #1e3a8a; font-weight: 700; }
-    h2 { color: #1e40af; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px; }
-    h3 { color: #3b82f6; }
-    .chat-container {
-        display: flex;
-        flex-direction: column;
-        gap: 15px;
+
+    h1, h2, h3 {
+        color: #38bdf8;
     }
+
+    /* Chat bubbles */
     .user-bubble {
         align-self: flex-end;
-        background-color: #eff6ff;
-        border: 1px solid #bfdbfe;
-        color: #1e3a8a;
+        background-color: #1d4ed8;
+        border: 1px solid #60a5fa;
+        color: #e5e7eb;
         padding: 15px;
         border-radius: 15px 15px 0 15px;
         margin-left: 20%;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        box-shadow: 0 2px 4px rgba(0,0,0,0.3);
     }
     .bot-bubble {
         align-self: flex-start;
-        background-color: #ffffff;
-        border: 1px solid #e5e7eb;
-        color: #374151;
+        background-color: #020617;
+        border: 1px solid #334155;
+        color: #e5e7eb;
         padding: 20px;
         border-radius: 15px 15px 15px 0;
         margin-right: 10%;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        box-shadow: 0 4px 6px rgba(0,0,0,0.4);
     }
+
     .source-metadata {
         font-size: 0.8rem;
-        color: #6b7280;
+        color: #9ca3af;
         margin-bottom: 5px;
         font-weight: 600;
         text-transform: uppercase;
@@ -126,17 +121,26 @@ st.markdown(
     }
     .source-content {
         font-family: 'Georgia', serif;
-        border-left: 4px solid #3b82f6;
+        border-left: 4px solid #38bdf8;
         padding-left: 10px;
         margin-top: 5px;
-        background-color: #f9fafb;
+        background-color: #020617;
     }
+
     div[data-testid="stMetricValue"] {
         font-size: 1.5rem;
-        color: #2563eb;
+        color: #38bdf8;
     }
+
+    /* Sidebar dark mode */
     section[data-testid="stSidebar"] {
-        background-color: #f1f5f9;
+        background-color: #020617;
+    }
+    section[data-testid="stSidebar"] * {
+        color: #e5e7eb !important;
+    }
+    section[data-testid="stSidebar"] .stSlider label {
+        color: #e5e7eb !important;
     }
 </style>
 """,
@@ -150,10 +154,6 @@ st.markdown(
 
 @dataclass
 class DocumentChunk:
-    """
-    Represents a single piece of processed text with its metadata.
-    """
-
     id: str
     text: str
     source_file: str
@@ -167,10 +167,6 @@ class DocumentChunk:
 
 @dataclass
 class SearchResult:
-    """
-    Represents a retrieved result from the vector store.
-    """
-
     chunk: DocumentChunk
     score: float
     relevance_label: str
@@ -182,15 +178,8 @@ class SearchResult:
 
 
 class TextProcessor:
-    """
-    Advanced text cleaning and normalization utilities.
-    """
-
     @staticmethod
     def clean_text(text: str) -> str:
-        """
-        Applies a pipeline of cleaning operations to raw text.
-        """
         if not text:
             return ""
 
@@ -206,23 +195,8 @@ class TextProcessor:
 
         return text.strip()
 
-    @staticmethod
-    def calculate_stats(text: str) -> Dict[str, Any]:
-        words = text.split()
-        sentences = re.split(r"[.!?]+", text)
-        return {
-            "char_count": len(text),
-            "word_count": len(words),
-            "sentence_count": len(sentences),
-            "avg_word_len": sum(len(w) for w in words) / len(words) if words else 0,
-        }
-
 
 class DocumentIngestor:
-    """
-    Handles file upload, reading, and chunking logic.
-    """
-
     def __init__(self) -> None:
         self.processor = TextProcessor()
 
@@ -231,7 +205,6 @@ class DocumentIngestor:
     ) -> List[DocumentChunk]:
         chunks: List[DocumentChunk] = []
         try:
-            # Streamlit UploadedFile yeniden okunabilir olsun diye BytesIO ile sarıyoruz
             pdf_bytes = file_obj.read()
             pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
             file_name = file_obj.name
@@ -284,10 +257,6 @@ class DocumentIngestor:
 
 
 class VectorDatabase:
-    """
-    Manages FAISS index and embedding model.
-    """
-
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
         self.model: Optional[SentenceTransformer] = None
@@ -375,10 +344,6 @@ class VectorDatabase:
 
 
 class SessionManager:
-    """
-    Centralized management of Streamlit Session State.
-    """
-
     @staticmethod
     def initialize() -> None:
         if "db" not in st.session_state:
@@ -417,12 +382,9 @@ class SessionManager:
 
 def render_sidebar() -> Tuple[int, int, int, bool]:
     with st.sidebar:
-        st.image(
-            "https://cdn-icons-png.flaticon.com/512/9626/9626620.png",
-            width=80,
-        )
+        # Takvim görseli kaldırıldı, sade başlık
         st.title("System Control")
-        st.caption(f"v3.5.0 | {datetime.now().strftime('%Y-%m-%d')}")
+        st.caption(f"Demo v3.5.0 | {datetime.now().strftime('%Y-%m-%d')}")
 
         st.divider()
 
@@ -432,7 +394,7 @@ def render_sidebar() -> Tuple[int, int, int, bool]:
             min_value=100,
             max_value=1000,
             value=500,
-            help="Number of words per semantic unit. Smaller = more specific.",
+            help="Number of words per chunk. Smaller = more specific answers.",
         )
         overlap = st.slider(
             "Overlap Window",
@@ -458,11 +420,11 @@ def render_sidebar() -> Tuple[int, int, int, bool]:
         with col1:
             if st.button("Clear Chat", use_container_width=True):
                 SessionManager.clear_history()
-                st.experimental_rerun()
+                st.rerun()
         with col2:
             if st.button("Reset All", use_container_width=True):
                 st.session_state.clear()
-                st.experimental_rerun()
+                st.rerun()
 
         st.divider()
         with st.expander("System Logs", expanded=False):
@@ -508,7 +470,7 @@ def render_analytics_tab(db: VectorDatabase) -> None:
                 color="source",
                 hover_data=["text"],
                 title="3D Document Cluster Map",
-                template="plotly_white",
+                template="plotly_dark",
                 height=600,
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -522,6 +484,7 @@ def render_analytics_tab(db: VectorDatabase) -> None:
         nbins=20,
         labels={"x": "Word Count"},
         title="Distribution of Information Density",
+        template="plotly_dark",
     )
     st.plotly_chart(fig_hist, use_container_width=True)
 
@@ -540,11 +503,9 @@ def render_file_upload_area(chunk_size: int, overlap: int) -> None:
         f for f in uploaded_files if f.name not in st.session_state.processed_files
     ]
 
-    # Bütün dosyalardan gelen chunkları burada toplayacağız
-    all_chunks: List[DocumentChunk] = []
-
     if new_files:
         if st.button(f"Process {len(new_files)} New Files", type="primary"):
+            all_chunks: List[DocumentChunk] = []
             progress_bar = st.progress(0, text="Starting ingestion...")
 
             for i, file in enumerate(new_files):
@@ -555,7 +516,6 @@ def render_file_upload_area(chunk_size: int, overlap: int) -> None:
                     (i + 1) / len(new_files), text=f"Processed {file.name}"
                 )
 
-            # Daha önce işlenenler + yeni işlenenler
             if "all_chunks" in st.session_state:
                 st.session_state.all_chunks.extend(all_chunks)
             else:
@@ -574,7 +534,7 @@ def render_file_upload_area(chunk_size: int, overlap: int) -> None:
                         f"Successfully indexed {len(st.session_state.all_chunks)} chunks!"
                     )
                     time.sleep(1)
-                    st.experimental_rerun()
+                    st.rerun()
 
             progress_bar.empty()
     else:
@@ -588,7 +548,6 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
         st.warning("⚠ System Offline. Please process documents in the 'Upload' tab.")
         return
 
-    # Show history as pretty bubbles
     for msg in st.session_state.chat_history:
         if msg["role"] == "user":
             st.markdown(
@@ -605,7 +564,7 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
 
     if prompt:
         SessionManager.add_message("user", prompt)
-        st.experimental_rerun()
+        st.rerun()
 
     if (
         st.session_state.chat_history
@@ -637,14 +596,14 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
                     found_valid_result = True
 
                     if res.relevance_label == "HIGH":
-                        color = "#16a34a"
+                        color = "#22c55e"
                     elif res.relevance_label == "MEDIUM":
-                        color = "#ca8a04"
+                        color = "#eab308"
                     else:
-                        color = "#dc2626"
+                        color = "#f97316"
 
                     response_html += f"""
-                    <div style="border-left: 5px solid {color}; padding-left: 15px; margin-bottom: 20px; background: #fff; padding: 15px; border-radius: 5px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                    <div style="border-left: 5px solid {color}; padding-left: 15px; margin-bottom: 20px; background: #020617; padding: 15px; border-radius: 5px; box-shadow: 0 1px 3px rgba(0,0,0,0.5);">
                         <div class="source-metadata">
                             📄 {res.chunk.source_file} | Page {res.chunk.page_number} | 
                             <span style="color:{color}; font-weight:bold;">{res.relevance_label} CONFIDENCE ({res.score:.3f})</span>
@@ -663,7 +622,7 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
                     )
 
             SessionManager.add_message("assistant", response_html)
-            st.experimental_rerun()
+            st.rerun()
 
 
 # ==============================================================================
@@ -676,9 +635,9 @@ def main() -> None:
 
     chunk_size, overlap, top_k, strict_mode = render_sidebar()
 
-    st.title("🧠 DocuChat Enterprise")
+    st.title("🧠 DocuChat Enterprise Demo")
     st.caption(
-        "Advanced Retrieval-Augmented Generation (RAG) System for Document Analysis"
+        "Local Retrieval-Augmented Generation system for PDF document analysis."
     )
 
     tab1, tab2, tab3 = st.tabs(
@@ -696,3 +655,4 @@ def main() -> None:
 
 
 main()
+
