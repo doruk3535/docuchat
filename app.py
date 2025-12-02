@@ -1,535 +1,419 @@
-import io
-from typing import List, Tuple
-
 import streamlit as st
 import PyPDF2
-import numpy as np
-import faiss
 from sentence_transformers import SentenceTransformer
-from sklearn.cluster import KMeans
+import faiss
+import numpy as np
+import pandas as pd
+import io
+import os
+import pickle
+from typing import List, Tuple
+import plotly.express as px
+from sklearn.decomposition import PCA
 
-# ------------------------------------------------------
-# DocuChat – Free RAG-Style PDF QA + Summarization
-# (No OpenAI, English UI but works with Turkish/English PDFs)
-#
-# Layers:
-# - User Interface Layer: Streamlit web app
-# - Document Processing Layer: PDF parsing, cleaning, chunking
-# - Processing & Retrieval Layer: embeddings + FAISS vector search
-# - Answering Layer: semantic ranking + lightweight "rewrite" for QA
-# - Summarization Layer: sentence embeddings + KMeans clustering
-# ------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 1. CONFIGURATION & STYLING
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="DocuChat Enterprise",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-
-
-# ------------- MODEL LOADING (shared across sessions) -------------
-@st.cache_resource
-def load_embedder() -> SentenceTransformer:
-    """Load the sentence-transformers model once and reuse it."""
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-
-# ------------------------ DOCUMENT PROCESSING ------------------------
-def parse_pdf(file_bytes: bytes) -> Tuple[str, int]:
-    """
-    Extract raw text and number of pages from a PDF.
-    """
-    pdf_io = io.BytesIO(file_bytes)
-    reader = PyPDF2.PdfReader(pdf_io)
-    pages = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        pages.append(text)
-    full_text = "\n".join(pages)
-    num_pages = len(reader.pages)
-    return full_text, num_pages
-
-
-def clean_text(text: str) -> str:
-    """
-    Simple cleaning: strip whitespace, remove empty lines, normalize spaces.
-    """
-    lines = [line.strip() for line in text.splitlines()]
-    lines = [line for line in lines if line]
-    cleaned = " ".join(lines)
-    cleaned = " ".join(cleaned.split())
-    return cleaned
+# Custom CSS for a professional look
+st.markdown("""
+<style>
+    .main {
+        background-color: #f8f9fa;
+    }
+    .stChatMessage {
+        background-color: #ffffff;
+        border: 1px solid #dee2e6;
+        border-radius: 12px;
+        padding: 15px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    .metric-card {
+        background-color: #ffffff;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 5px solid #4e8cff;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    h1, h2, h3 {
+        color: #2c3e50;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
-def chunk_text(text: str, max_tokens: int = 800, overlap: int = 100) -> List[str]:
-    """
-    Split the document into overlapping chunks.
-    Here "tokens" ~ words (approximation is fine for our use case).
-    """
-    words = text.split()
-    chunks: List[str] = []
-    start = 0
-    while start < len(words):
-        end = start + max_tokens
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
-        start += max_tokens - overlap
-    return chunks
+# -----------------------------------------------------------------------------
+# 2. CORE CLASSES (OOP Architecture)
+# -----------------------------------------------------------------------------
+
+class DocumentProcessor:
+    """Handles PDF reading, text cleaning, and chunking."""
+    
+    @staticmethod
+    def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, int]:
+        """Extracts raw text and page count from a PDF file."""
+        try:
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            text_parts = []
+            num_pages = len(pdf_reader.pages)
+            
+            # Using a list and joining at the end is faster for large texts (9000+ words)
+            for page in pdf_reader.pages:
+                content = page.extract_text()
+                if content:
+                    text_parts.append(content)
+            
+            full_text = "\n".join(text_parts)
+            return full_text, num_pages
+        except Exception as e:
+            st.error(f"Error reading PDF: {e}")
+            return "", 0
+
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """Cleans whitespace and standardizes text."""
+        # Replace newlines with spaces to maintain flow in chunks
+        text = text.replace("\n", " ")
+        # Remove multiple spaces
+        text = " ".join(text.split())
+        return text
+
+    @staticmethod
+    def create_chunks(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+        """
+        Splits text into overlapping chunks.
+        - chunk_size: Number of words per chunk.
+        - overlap: Number of words to overlap between chunks (preserves context).
+        """
+        words = text.split()
+        chunks = []
+        if not words:
+            return chunks
+            
+        # Sliding window approach
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk = " ".join(words[i:i + chunk_size])
+            chunks.append(chunk)
+        return chunks
 
 
-# ------------------------ EMBEDDINGS + FAISS ------------------------
-def embed_texts(embedder: SentenceTransformer, texts: List[str]) -> np.ndarray:
-    """
-    Compute sentence-transformer embeddings and L2-normalize them
-    so cosine similarity can be approximated by inner product.
-    """
-    emb = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False)
-    norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-10
-    emb = emb / norms
-    return emb.astype("float32")
+class VectorStoreManager:
+    """Manages the AI model, embeddings, and FAISS index."""
+    
+    def _init_(self, model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'):
+        self.model_name = model_name
+        self._model = None
+        self.index = None
+        self.chunks = []
+        self.embeddings = None
+
+    @property
+    def model(self):
+        """Lazy loads the model only when needed."""
+        if self._model is None:
+            with st.spinner(f"Loading AI Model ({self.model_name})..."):
+                self._model = SentenceTransformer(self.model_name)
+        return self._model
+
+    def process_and_index(self, chunks: List[str]):
+        """Generates embeddings and builds the FAISS index."""
+        self.chunks = chunks
+        if not chunks:
+            return
+        
+        # Encode all chunks (this might take time for 9000+ words, hence the progress bar)
+        embeddings = self.model.encode(chunks, show_progress_bar=True)
+        self.embeddings = np.array(embeddings).astype('float32')
+        
+        # Create FAISS Index (L2 Distance / Euclidean)
+        dimension = self.embeddings.shape[1]
+        self.index = faiss.IndexFlatL2(dimension)
+        self.index.add(self.embeddings)
+        
+        return self.index
+
+    def search(self, query: str, k: int = 3) -> Tuple[List[str], List[float]]:
+        """Searches for the top-k most relevant chunks."""
+        if not self.index:
+            return [], []
+            
+        query_vector = self.model.encode([query]).astype('float32')
+        distances, indices = self.index.search(query_vector, k)
+        
+        results = []
+        scores = []
+        
+        # indices[0] contains the IDs of the matching chunks
+        for i, idx in enumerate(indices[0]):
+            if idx < len(self.chunks):
+                results.append(self.chunks[idx])
+                scores.append(distances[0][i])
+                
+        return results, scores
+
+    def save_index(self, file_path: str = "vector_store.pkl"):
+        """Saves the current index and chunks to disk."""
+        data = {
+            "chunks": self.chunks,
+            "embeddings": self.embeddings
+        }
+        with open(file_path, "wb") as f:
+            pickle.dump(data, f)
+
+    def load_index(self, file_path: str = "vector_store.pkl"):
+        """Loads index and chunks from disk."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError("No saved index found.")
+            
+        with open(file_path, "rb") as f:
+            data = pickle.load(f)
+            
+        self.chunks = data["chunks"]
+        self.embeddings = data["embeddings"]
+        
+        # Rebuild FAISS index from loaded embeddings
+        dimension = self.embeddings.shape[1]
+        self.index = faiss.IndexFlatL2(dimension)
+        self.index.add(self.embeddings)
 
 
-def build_faiss_index(vectors: np.ndarray) -> faiss.IndexFlatIP:
-    """
-    Build a FAISS index using inner product (cosine similarity on normalized vectors).
-    """
-    dim = vectors.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(vectors)
-    return index
+class VisualizationEngine:
+    """Handles 2D plotting of high-dimensional vectors."""
+    
+    @staticmethod
+    def plot_embeddings_2d(embeddings, chunks, query_embedding=None):
+        """Reduces vectors to 2D using PCA and plots them with Plotly."""
+        if embeddings is None or len(embeddings) < 3:
+            st.warning("Not enough data to visualize (needs at least 3 chunks).")
+            return None
 
+        # Dimensionality Reduction (384 dim -> 2 dim)
+        pca = PCA(n_components=2)
+        reduced_vecs = pca.fit_transform(embeddings)
+        
+        df = pd.DataFrame(reduced_vecs, columns=['x', 'y'])
+        # Preview first 100 chars for tooltip
+        df['text_preview'] = [c[:120] + "..." for c in chunks]
+        df['type'] = 'Document Segment'
+        
+        # Add query point if it exists
+        if query_embedding is not None:
+            query_reduced = pca.transform(query_embedding)
+            df_query = pd.DataFrame(query_reduced, columns=['x', 'y'])
+            df_query['text_preview'] = '🔴 YOUR QUESTION'
+            df_query['type'] = 'Current Question'
+            df = pd.concat([df, df_query], ignore_index=True)
 
-@st.cache_data(show_spinner=False)
-def process_document(
-    file_bytes: bytes,
-    chunk_size: int,
-    overlap: int,
-    max_chunks: int = 100,
-) -> Tuple[List[str], faiss.IndexFlatIP, int, int, str]:
-    """
-    End-to-end document processing:
-    - parse PDF
-    - clean text
-    - chunk
-    - embed chunks
-    - build FAISS index
-
-    Returns:
-      chunks, index, num_pages, num_words, cleaned_text
-    """
-    embedder = load_embedder()
-
-    raw_text, num_pages = parse_pdf(file_bytes)
-    cleaned = clean_text(raw_text)
-    num_words = len(cleaned.split())
-
-    chunks = chunk_text(cleaned, max_tokens=chunk_size, overlap=overlap)
-
-    # Limit number of chunks for performance on very large PDFs
-    if len(chunks) > max_chunks:
-        chunks = chunks[:max_chunks]
-
-    vectors = embed_texts(embedder, chunks)
-    index = build_faiss_index(vectors)
-
-    return chunks, index, num_pages, num_words, cleaned
-
-
-def retrieve_context(
-    embedder: SentenceTransformer,
-    question: str,
-    chunks: List[str],
-    index: faiss.IndexFlatIP,
-    k: int = 4,
-) -> Tuple[str, np.ndarray, List[str]]:
-    """
-    Given a user question:
-      - embed the question
-      - retrieve top-k most similar chunks from FAISS
-      - return combined context, scores, and individual selected chunks
-    """
-    q_emb = embed_texts(embedder, [question])  # (1, dim)
-    scores, indices = index.search(q_emb, k)
-    selected_chunks = [chunks[i] for i in indices[0]]
-    context_text = "\n\n---\n\n".join(selected_chunks)
-    return context_text, scores[0], selected_chunks
-
-
-# ------------------------ SENTENCE SPLITTING ------------------------
-def split_sentences(text: str) -> List[str]:
-    """
-    Slightly better sentence splitter:
-    - splits on '.', '!' and '?'
-    - removes very short fragments
-    Works fine for both Turkish and English.
-    """
-    text = text.replace("\n", " ")
-    separators = [".", "!", "?"]
-    for sep in separators:
-        text = text.replace(sep, ".")
-    parts = text.split(".")
-    sentences = [s.strip() for s in parts if len(s.strip()) > 25]
-    return sentences
-
-
-# ------------------------ LIGHTWEIGHT REWRITE FOR QA ------------------------
-def rewrite_answer(question: str, sentences: List[str]) -> str:
-    """
-    Create a short, human-like answer by:
-    - merging extracted sentences
-    - cleaning and de-duplicating entity names
-    - special handling for 'who/kim/karakter' type questions
-    Works for Turkish + English.
-    """
-    if not sentences:
-        # Turkish fallback, çünkü sen genelde TR soruyorsun :)
-        return "Belgede bu soruya doğrudan cevap veren bir bilgi bulunamadı."
-
-    # 1) Merge all extracted sentences
-    text = " ".join(sentences)
-
-    # 2) Basic cleaning
-    text = text.replace(" ,", ",")
-    while "  " in text:
-        text = text.replace("  ", " ")
-    text = text.strip()
-
-    # 3) Extract candidate entities (proper-looking words)
-    #    Büyük harfle başlayan ve 3+ harfli olanları al.
-    words = text.replace(",", " ").split()
-    candidates = [w.strip() for w in words if w and w[0].isupper() and len(w) > 2]
-    unique_entities = sorted(set(candidates))
-
-    lower_q = question.lower()
-
-    # 4) If question is about characters/people
-    if ("kim" in lower_q) or ("karakter" in lower_q) or ("who" in lower_q):
-        if unique_entities:
-            return "Bu belgede geçen kişiler: " + ", ".join(unique_entities) + "."
-
-    # 5) Default short rewrite for other types of questions
-    if len(text) > 280:
-        text = text[:280].rsplit(" ", 1)[0] + "..."
-
-    return text
-
-
-# ------------------------ QA ANSWERING LAYER ------------------------
-def generate_answer_from_context(
-    embedder: SentenceTransformer,
-    question: str,
-    selected_chunks: List[str],
-    top_n_sentences: int = 4,
-) -> Tuple[str, List[str]]:
-    """
-    Improved extractive answering:
-      - split selected chunks into sentences
-      - embed each sentence and the question
-      - compute cosine similarity
-      - pick top-N sentences that are both:
-          * highly relevant to the question
-          * not near-duplicates of each other
-      - then pass them through a lightweight "rewrite" step
-        to sound more like an intelligent answer.
-    """
-    full_text = "\n ".join(selected_chunks)
-    sentences = split_sentences(full_text)
-
-    if not sentences:
-        return "Belgede bu soruya doğrudan cevap veren bir bilgi bulunamadı.", []
-
-    # Embed question and sentences
-    q_emb = embed_texts(embedder, [question])      # (1, dim)
-    sent_embs = embed_texts(embedder, sentences)   # (N, dim)
-
-    sims = np.dot(q_emb, sent_embs.T)[0]           # (N,)
-
-    # Sort sentences by similarity (desc)
-    sorted_idx = np.argsort(-sims)
-
-    # Threshold: if even the best match is low, say "not found"
-    best_sim = sims[sorted_idx[0]]
-    MIN_SIM_THRESHOLD = 0.30
-
-    if best_sim < MIN_SIM_THRESHOLD:
-        return (
-            "I could not confidently answer this question from the document. "
-            "The relevant information may not be present or is only loosely related.",
-            [],
+        fig = px.scatter(
+            df, x='x', y='y', 
+            color='type', 
+            hover_data=['text_preview'],
+            title="Semantic Data Map (PCA Projection)",
+            color_discrete_map={'Document Segment': '#0084ff', 'Current Question': '#ff4b4b'},
+            size_max=12
         )
-
-    # Select top-N sentences with diversity (no near-duplicates)
-    selected_sentences: List[str] = []
-    selected_vectors: List[np.ndarray] = []
-
-    MAX_SENTENCES = max(1, top_n_sentences)
-
-    for idx in sorted_idx:
-        if len(selected_sentences) >= MAX_SENTENCES:
-            break
-
-        candidate = sentences[idx].strip()
-        cand_vec = sent_embs[idx]
-
-        # Check similarity to already selected sentences (to avoid duplicates)
-        is_duplicate = False
-        for vec in selected_vectors:
-            sim_to_selected = float(np.dot(cand_vec, vec))
-            if sim_to_selected > 0.9:  # nearly identical sentence
-                is_duplicate = True
-                break
-
-        if not is_duplicate:
-            selected_sentences.append(candidate)
-            selected_vectors.append(cand_vec)
-
-    if not selected_sentences:
-        # Fallback: at least the single best one
-        best_idx = int(sorted_idx[0])
-        selected_sentences = [sentences[best_idx].strip()]
-
-    # 🔥 Burada "akıllı" rewrite devreye giriyor
-    final_answer = rewrite_answer(question, selected_sentences)
-
-    return final_answer, selected_sentences
+        fig.update_layout(
+            plot_bgcolor='rgba(240,242,246,0.5)',
+            xaxis=dict(showgrid=True, gridcolor='#e0e0e0'),
+            yaxis=dict(showgrid=True, gridcolor='#e0e0e0')
+        )
+        return fig
 
 
-# ------------------------ SUMMARIZATION LAYER ------------------------
-def summarize_document(
-    embedder: SentenceTransformer,
-    cleaned_text: str,
-    num_summary_sentences: int = 6,
-) -> str:
-    """
-    Smart extractive summarization:
-      - split whole document into sentences
-      - embed all sentences
-      - cluster with KMeans
-      - pick one representative sentence per cluster
-      - order them by original position and join as a coherent summary
-    """
-    sentences = split_sentences(cleaned_text)
-    if not sentences:
-        return "I could not extract any sentences from this document."
+# -----------------------------------------------------------------------------
+# 3. MAIN APPLICATION LOGIC
+# -----------------------------------------------------------------------------
 
-    if len(sentences) <= num_summary_sentences:
-        return " ".join(sentences)
-
-    # Embed all sentences
-    sent_embs = embed_texts(embedder, sentences)
-
-    k = min(num_summary_sentences, sent_embs.shape[0])
-    if k <= 1:
-        return sentences[0]
-
-    kmeans = KMeans(n_clusters=k, n_init=5, random_state=42)
-    kmeans.fit(sent_embs)
-    centers = kmeans.cluster_centers_
-
-    selected_idx: List[int] = []
-
-    for ci in range(k):
-        cluster_indices = np.where(kmeans.labels_ == ci)[0]
-        if len(cluster_indices) == 0:
-            continue
-        cluster_vectors = sent_embs[cluster_indices]
-        center = centers[ci]
-        sims = np.dot(cluster_vectors, center)
-        best_local = cluster_indices[int(np.argmax(sims))]
-        selected_idx.append(best_local)
-
-    # Sorted & unique indices
-    selected_idx = sorted(set(selected_idx))
-    selected_idx = selected_idx[:num_summary_sentences]
-
-    summary_sentences = [sentences[i] for i in selected_idx]
-    summary_text = " ".join(summary_sentences)
-
-    return "In summary, " + summary_text
-
-
-# ------------------------ STREAMLIT UI ------------------------
 def main():
-    st.set_page_config(page_title="DocuChat – Free RAG", layout="wide")
-
-    embedder = load_embedder()
-
-    # Sidebar – architecture + controls
+    # --- Sidebar ---
     with st.sidebar:
-        st.title("DocuChat – Architecture")
+        st.title("🎛 Control Panel")
+        
+        st.subheader("1. File Management")
+        uploaded_file = st.file_uploader("Upload PDF", type="pdf", help="Supports large text-based PDFs.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Save Index 💾"):
+                if st.session_state.get('vector_manager') and st.session_state.get('processed'):
+                    try:
+                        st.session_state['vector_manager'].save_index()
+                        st.success("Saved!")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+                else:
+                    st.warning("Process a file first.")
+        with col2:
+            if st.button("Load Index 📂"):
+                try:
+                    if 'vector_manager' not in st.session_state:
+                        st.session_state['vector_manager'] = VectorStoreManager()
+                    st.session_state['vector_manager'].load_index()
+                    st.session_state['processed'] = True
+                    st.session_state['file_name'] = "Loaded from Disk"
+                    st.success("Loaded!")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Load failed: {e}")
 
-        st.markdown("### Mode")
-        mode = st.radio(
-            "Choose mode",
-            ["Question Answering", "Document Summarization"],
-            index=0,
-        )
+        st.divider()
+        st.subheader("2. Analysis Parameters")
+        chunk_size = st.slider("Chunk Size (Words)", 100, 2000, 500, help="Larger chunks = more context, but less specific.")
+        overlap = st.slider("Overlap (Words)", 0, 500, 50, help="Prevents cutting sentences in half.")
+        top_k = st.slider("Retrieval Count (Top-K)", 1, 20, 4, help="How many sections to retrieve.")
+        
+        st.divider()
+        if st.button("Clear History 🗑"):
+            st.session_state.messages = []
+            st.rerun()
 
-        st.markdown("### Layers")
-        st.markdown("**User Interface Layer**")
-        st.caption("Streamlit web app: file upload, question input, answer display.")
+    # --- Session State Initialization ---
+    if "messages" not in st.session_state:
+        st.session_state.messages = [{"role": "assistant", "content": "Hello! I am your Enterprise Document Assistant. Upload a large PDF to begin."}]
+    
+    if "vector_manager" not in st.session_state:
+        st.session_state.vector_manager = VectorStoreManager()
+        
+    if "processed" not in st.session_state:
+        st.session_state.processed = False
 
-        st.markdown("**Document Processing Layer**")
-        st.caption("PDF parsing, text cleaning, chunking.")
+    # --- File Processing Logic ---
+    if uploaded_file and not st.session_state.processed:
+        with st.status("🚀 Processing large document...", expanded=True) as status:
+            st.write("📖 Reading PDF content...")
+            file_bytes = uploaded_file.read()
+            text_content, num_pages = DocumentProcessor.extract_text_from_pdf(file_bytes)
+            
+            # Basic validation for content
+            if len(text_content) < 50:
+                status.update(label="Error: PDF is empty or unreadable.", state="error")
+                st.error("Could not extract text. Ensure the PDF is not a scanned image.")
+                return
 
-        st.markdown("**Processing & Retrieval Layer**")
-        st.caption("Sentence embeddings + FAISS vector search.")
+            st.write(f"🧹 Cleaning and analyzing {len(text_content.split())} words...")
+            clean_content = DocumentProcessor.clean_text(text_content)
+            
+            st.write("✂ Splitting into semantic chunks...")
+            chunks = DocumentProcessor.create_chunks(clean_content, chunk_size, overlap)
+            
+            st.write(f"🧠 Generating vector embeddings for {len(chunks)} chunks...")
+            st.session_state.vector_manager.process_and_index(chunks)
+            
+            # Save metadata to session
+            st.session_state.processed = True
+            st.session_state.file_name = uploaded_file.name
+            st.session_state.num_pages = num_pages
+            st.session_state.total_words = len(clean_content.split())
+            st.session_state.total_chunks = len(chunks)
+            
+            status.update(label="✅ System Ready!", state="complete")
 
-        st.markdown("**Answering Layer**")
-        st.caption("Semantic sentence ranking + lightweight rewrite for QA.")
+    # --- Main Interface ---
+    st.title("🧠 DocuChat Enterprise")
+    
+    # Show document stats if processed
+    if st.session_state.processed:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("File Name", st.session_state.get('file_name', 'N/A'))
+        c2.metric("Total Pages", st.session_state.get('num_pages', 0))
+        c3.metric("Total Words", f"{st.session_state.get('total_words', 0):,}")
+        c4.metric("Knowledge Chunks", st.session_state.get('total_chunks', 0))
 
-        st.markdown("**Summarization Layer**")
-        st.caption("Sentence embeddings + KMeans clustering to build a global summary.")
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["💬 Chat", "📊 Visualization", "📄 Data Explorer"])
 
-        st.markdown("---")
-        st.markdown("### Model & Index")
-        st.write(f"Embedding model: `{EMBEDDING_MODEL_NAME}`")
-        st.write("Vector index: FAISS (Inner Product, cosine on normalized vectors)")
+    # ---------------- TAB 1: CHAT ----------------
+    with tab1:
+        # Display history
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"], unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.markdown("### Retrieval Settings (for QA)")
+        # Chat Input
+        if prompt := st.chat_input("Ask a question about the document..."):
+            # User message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            st.chat_message("user").write(prompt)
 
-        chunk_size = st.slider(
-            "Chunk size (words)",
-            min_value=200,
-            max_value=1200,
-            step=100,
-            value=800,
-        )
-        overlap = st.slider(
-            "Chunk overlap (words)",
-            min_value=0,
-            max_value=400,
-            step=50,
-            value=100,
-        )
-        k_chunks = st.slider(
-            "Top-k chunks to retrieve",
-            min_value=1,
-            max_value=10,
-            step=1,
-            value=4,
-        )
-        top_n_sentences = st.slider(
-            "Top-N sentences for the answer",
-            min_value=1,
-            max_value=10,
-            step=1,
-            value=4,
-        )
+            # Assistant Logic
+            with st.chat_message("assistant"):
+                vm = st.session_state.vector_manager
+                
+                if not vm.index:
+                    st.warning("Please upload a document first.")
+                else:
+                    # 1. Search
+                    results, scores = vm.search(prompt, k=top_k)
+                    
+                    if not results:
+                        response_text = "I couldn't find any relevant information in the document."
+                    else:
+                        # 2. Format Response
+                        response_text = f"*I found {len(results)} relevant sections in '{st.session_state.get('file_name', 'the document')}':*\n\n"
+                        
+                        for i, (res, score) in enumerate(zip(results, scores), 1):
+                            # Interpret score (Lower L2 distance = better match)
+                            match_quality = "Excellent" if score < 0.8 else "Good" if score < 1.2 else "Weak"
+                            color = "#28a745" if match_quality == "Excellent" else "#ffc107" if match_quality == "Good" else "#dc3545"
+                            
+                            response_text += f"""
+<div style="background-color: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 12px; border-left: 4px solid {color};">
+    <div style="font-weight: bold; color: #333; margin-bottom: 4px;">
+        Result #{i} <span style="font-size: 0.8em; color: #666; font-weight: normal;">(Match: {match_quality}, Score: {score:.2f})</span>
+    </div>
+    <div style="color: #444; line-height: 1.5;">{res}</div>
+</div>
+"""
+                        response_text += "\n<small style='color:grey'>Note: These are exact extracts from the document. No external AI generation was used.</small>"
 
-        st.markdown("---")
-        st.markdown("### Summarization Settings")
-        summary_sentences = st.slider(
-            "Number of sentences in summary",
-            min_value=3,
-            max_value=10,
-            step=1,
-            value=6,
-        )
+                # Display and Save
+                st.markdown(response_text, unsafe_allow_html=True)
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
 
-    st.title("DocuChat – Chat with Your PDF (Free, No API Key)")
+    # ---------------- TAB 2: VISUALIZATION ----------------
+    with tab2:
+        st.header("Semantic Data Map")
+        st.info("This interactive map shows how your document is distributed in the 'meaning space'. Dots close together have similar meanings.")
+        
+        if st.button("Generate/Refresh Map"):
+            with st.spinner("Calculating PCA projection..."):
+                vm = st.session_state.vector_manager
+                if vm.embeddings is not None:
+                    # Get user's last question vector if available
+                    last_query_vec = None
+                    if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+                         last_query_text = st.session_state.messages[-1]["content"]
+                         last_query_vec = vm.model.encode([last_query_text])
+                    
+                    fig = VisualizationEngine.plot_embeddings_2d(vm.embeddings, vm.chunks, last_query_vec)
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("No data available. Upload a file first.")
 
-    st.markdown(
-        """
-        This prototype implements a **RAG-style pipeline without any paid APIs**.  
-        You can use it in two modes:
+    # ---------------- TAB 3: DATA EXPLORER ----------------
+    with tab3:
+        st.header("Raw Data Inspector")
+        st.write("Review how the system split your document.")
+        
+        vm = st.session_state.vector_manager
+        if vm.chunks:
+            df_chunks = pd.DataFrame(vm.chunks, columns=["Chunk Content"])
+            df_chunks.index.name = "ID"
+            st.dataframe(df_chunks, use_container_width=True)
+            
+            st.markdown("### Detailed View")
+            selected_id = st.number_input("Enter Chunk ID to inspect:", min_value=0, max_value=len(vm.chunks)-1, value=0)
+            st.text_area("Full Content:", value=vm.chunks[selected_id], height=200)
+        else:
+            st.info("No data processed yet.")
 
-        - **Question Answering:** Ask questions about the PDF and get *rewritten*, human-like answers.  
-        - **Document Summarization:** Generate a smart, global summary of the whole PDF.  
-
-        Under the hood it uses sentence embeddings, FAISS vector search and KMeans-based
-        summarization, plus a lightweight rewrite step to behave more like an intelligent AI system.
-        """
-    )
-
-    if "history" not in st.session_state:
-        # question, answer, context, scores, top_sentences
-        st.session_state.history: List[Tuple[str, str, str, np.ndarray, List[str]]] = []
-
-    uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
-
-    if uploaded_file is None:
-        st.info("To get started, please upload a PDF file.")
-        return
-
-    # Read file bytes once
-    file_bytes = uploaded_file.read()
-
-    # Process document (cached by bytes + settings)
-    with st.spinner("Processing document (parsing, chunking, embeddings, FAISS index)..."):
-        chunks, index, num_pages, num_words, cleaned_text = process_document(
-            file_bytes=file_bytes,
-            chunk_size=chunk_size,
-            overlap=overlap,
-        )
-
-    st.success("Document processed successfully.")
-    st.write(f"- Pages: **{num_pages}**")
-    st.write(f"- Approx. words: **{num_words}**")
-    st.write(f"- Number of chunks: **{len(chunks)}**")
-
-    st.markdown("---")
-
-    # ----------------- MODE 1: QUESTION ANSWERING -----------------
-    if mode == "Question Answering":
-        question = st.text_input("Ask a question about this document:")
-
-        if question:
-            with st.spinner("Retrieving relevant chunks and building an answer..."):
-                context, scores, selected_chunks = retrieve_context(
-                    embedder,
-                    question,
-                    chunks,
-                    index,
-                    k=k_chunks,
-                )
-
-                answer, top_sentences = generate_answer_from_context(
-                    embedder,
-                    question,
-                    selected_chunks,
-                    top_n_sentences=top_n_sentences,
-                )
-
-            st.session_state.history.append(
-                (question, answer, context, scores, top_sentences)
-            )
-
-        # Show answer & history
-        if st.session_state.history:
-            st.subheader("Question–Answer History")
-
-            for q, a, _, _, _ in reversed(st.session_state.history):
-                st.markdown(f"**Q:** {q}")
-                st.markdown(a)
-                st.markdown("---")
-
-            # Last interaction details
-            last_q, last_a, last_ctx, last_scores, last_top_sents = st.session_state.history[-1]
-
-            with st.expander("Details: retrieved chunks and similarity scores"):
-                st.markdown("**FAISS similarity scores for the last question (higher = more relevant):**")
-                st.write(last_scores)
-                st.markdown("---")
-                st.markdown("**Combined retrieved context (all selected chunks):**")
-                st.write(last_ctx)
-
-            with st.expander("Details: top-ranked sentences fed into the rewrite step"):
-                for s in last_top_sents:
-                    st.markdown(f"- {s}")
-
-    # ----------------- MODE 2: DOCUMENT SUMMARIZATION -----------------
-    else:
-        st.subheader("Document Summarization")
-
-        if st.button("Generate summary"):
-            with st.spinner("Generating smart summary of the document..."):
-                summary = summarize_document(
-                    embedder,
-                    cleaned_text,
-                    num_summary_sentences=summary_sentences,
-                )
-
-            st.markdown("### Summary")
-            st.write(summary)
-
-
-if __name__ == "__main__":
-    main()
+if _name_ == "_main_":
+    main()
