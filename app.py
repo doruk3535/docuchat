@@ -12,16 +12,18 @@ from sklearn.preprocessing import normalize
 
 
 st.set_page_config(
-    page_title="PDF QA",
+    page_title="CodeDocMate PDF Lite",
     page_icon="📄",
     layout="wide",
 )
+
+# --------------------- Styling ---------------------
 
 st.markdown(
     """
     <style>
     .stApp {
-        background: radial-gradient(circle at top left, #111827 0, #020617 50%, #020617 100%);
+        background: radial-gradient(circle at top left, #1f2937 0, #020617 45%, #020617 100%);
         color: #e5e7eb;
     }
     .block-container {
@@ -29,51 +31,51 @@ st.markdown(
         padding-bottom: 2.2rem;
         max-width: 1200px;
     }
-    .app-hero {
-        padding: 1.2rem 1.4rem;
-        border-radius: 1.1rem;
+    .cd-hero {
+        padding: 1.4rem 1.6rem;
+        border-radius: 1.3rem;
         background: linear-gradient(135deg, rgba(37,99,235,0.18), rgba(56,189,248,0.12));
         border: 1px solid rgba(148,163,184,0.6);
         backdrop-filter: blur(10px);
     }
-    .app-pill {
+    .cd-pill {
         display:inline-flex;
         align-items:center;
         gap:0.35rem;
-        padding:0.1rem 0.7rem;
+        padding:0.12rem 0.7rem;
         border-radius:999px;
         font-size:0.75rem;
         background:rgba(15,23,42,0.9);
         border:1px solid rgba(148,163,184,0.7);
         color:#e5e7eb;
     }
-    .app-section {
+    .cd-section {
         padding: 1.0rem 1.2rem;
         border-radius: 1.0rem;
         background: rgba(15,23,42,0.96);
         border: 1px solid rgba(30,64,175,0.9);
-        box-shadow: 0 16px 32px rgba(15,23,42,0.6);
+        box-shadow: 0 18px 36px rgba(15,23,42,0.6);
     }
-    .app-metric {
+    .cd-metric {
         padding: 0.6rem 0.8rem;
         border-radius: 0.8rem;
         background: rgba(15,23,42,0.96);
         border: 1px solid rgba(148,163,184,0.55);
         font-size: 0.8rem;
     }
-    .app-metric h3 {
+    .cd-metric h3 {
         font-size: 0.8rem;
         margin-bottom: 0.15rem;
         color: #9ca3af;
     }
-    .app-metric span {
+    .cd-metric span {
         font-size: 1.0rem;
         font-weight: 600;
         color: #e5e7eb;
     }
     .stButton>button {
         border-radius: 999px;
-        padding: 0.45rem 1.2rem;
+        padding: 0.5rem 1.3rem;
         border: 1px solid rgba(56,189,248,0.7);
         background: linear-gradient(120deg, #0369a1, #0ea5e9);
         color: white;
@@ -88,6 +90,8 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# --------------------- Data structures ---------------------
 
 
 @dataclass
@@ -104,6 +108,9 @@ class DocumentIndex:
     chunks: List[PdfChunk]
     vectorizer: TfidfVectorizer
     tfidf_matrix: np.ndarray
+
+
+# --------------------- PDF processing ---------------------
 
 
 def extract_pdf_text(uploaded_file) -> List[str]:
@@ -131,7 +138,7 @@ def build_document_index(uploaded_pdf, name: str) -> DocumentIndex:
         cid += 1
 
     if not texts:
-        raise RuntimeError("No text extracted from PDF.")
+        raise RuntimeError("No extractable text found in PDF.")
 
     vectorizer = TfidfVectorizer(
         analyzer="word",
@@ -152,6 +159,9 @@ def build_document_index(uploaded_pdf, name: str) -> DocumentIndex:
     )
 
 
+# --------------------- Retrieval & summarization ---------------------
+
+
 def retrieve_top_k(
     index: DocumentIndex,
     query: str,
@@ -166,7 +176,6 @@ def retrieve_top_k(
     results: List[tuple[PdfChunk, float]] = []
     for idx in top_idx:
         results.append((index.chunks[idx], float(sims[idx])))
-
     return results
 
 
@@ -177,59 +186,82 @@ def split_sentences(text: str) -> List[str]:
     return sentences
 
 
-def summarize_chunk(text: str, query: str, max_sentences: int = 3) -> str:
-    sentences = split_sentences(text)
-    if not sentences:
+def summarize_from_chunks(
+    chunks_with_scores: List[tuple[PdfChunk, float]],
+    query: str,
+    max_sentences: int = 5,
+) -> str:
+    if not chunks_with_scores:
+        return ""
+
+    all_sentences: List[Tuple[int, str, float, int]] = []
+    for rank, (chunk, score) in enumerate(chunks_with_scores):
+        s_list = split_sentences(chunk.text)
+        for idx_s, s in enumerate(s_list):
+            all_sentences.append((len(all_sentences), s, score, rank))
+
+    if not all_sentences:
         return ""
 
     q_tokens = [t.lower() for t in re.findall(r"\w+", query) if len(t) >= 3]
-    if not q_tokens:
-        return " ".join(sentences[:max_sentences])
 
-    scored: List[tuple[int, str]] = []
-    for s in sentences:
+    scored_sentences: List[tuple[float, int, str]] = []
+    for global_pos, s, chunk_score, rank in all_sentences:
         s_low = s.lower()
-        score = sum(s_low.count(tok) for tok in q_tokens)
-        scored.append((score, s))
+        overlap = sum(s_low.count(tok) for tok in q_tokens) if q_tokens else 0
+        pos_weight = 1.0 / (1.0 + rank)
+        score = overlap + 0.3 * pos_weight + 0.2 * chunk_score
+        scored_sentences.append((score, global_pos, s))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best = [s for sc, s in scored[:max_sentences] if sc > 0]
+    scored_sentences.sort(key=lambda x: x[0], reverse=True)
+    top = scored_sentences[: max_sentences * 3]
 
-    if not best:
-        best = sentences[:max_sentences]
+    top_sorted = sorted(top, key=lambda x: x[1])
+    selected: List[str] = []
+    used = set()
+    for _, _, s in top_sorted:
+        if s in used:
+            continue
+        selected.append(s)
+        used.add(s)
+        if len(selected) >= max_sentences:
+            break
 
-    return " ".join(best)
+    return " ".join(selected)
 
 
-def build_explanation(chunks_with_scores: List[tuple[PdfChunk, float]], query: str) -> str:
-    lines = [
-        "### Answer\n",
-        f"Question: {query}\n",
-        "",
-    ]
-
-    if not chunks_with_scores:
-        lines.append("No relevant text found.")
-        return "\n".join(lines)
-
-    top_chunk, _ = chunks_with_scores[0]
-    summary = summarize_chunk(top_chunk.text, query, max_sentences=3)
-
-    lines.append("Summary:")
-    lines.append(summary or "(no summary available)")
+def build_answer(chunks_with_scores: List[tuple[PdfChunk, float]], query: str) -> str:
+    lines: List[str] = []
+    lines.append("### Answer")
+    lines.append("")
+    lines.append(f"Question: {query}")
     lines.append("")
 
-    lines.append("Sources:")
-    for ch, score in chunks_with_scores:
+    if not chunks_with_scores:
+        lines.append("No relevant text found in the document.")
+        return "\n".join(lines)
+
+    summary = summarize_from_chunks(chunks_with_scores, query, max_sentences=4)
+    if not summary:
+        summary = "A concise summary could not be generated from the current text."
+
+    lines.append("Summary:")
+    lines.append(summary)
+    lines.append("")
+
+    lines.append("Relevant pages:")
+    for chunk, score in chunks_with_scores:
         score_pct = round(score * 100, 1)
-        preview = summarize_chunk(ch.text, query, max_sentences=2)
+        preview = summarize_from_chunks([(chunk, score)], query, max_sentences=2)
         lines.append(
-            f"- Page {ch.page_num} · relevance ~ {score_pct}%\n"
-            f"  {preview}\n"
+            f"- Page {chunk.page_num} · relevance ~ {score_pct}%\n"
+            f"  {preview}"
         )
 
     return "\n".join(lines)
 
+
+# --------------------- Session state ---------------------
 
 if "doc_index" not in st.session_state:
     st.session_state.doc_index = None  # type: ignore
@@ -240,47 +272,53 @@ n_pages = idx.n_pages if idx else 0
 n_chunks = len(idx.chunks) if idx else 0
 doc_name = idx.doc_name if idx else "—"
 
+# --------------------- Hero + metrics ---------------------
+
 st.markdown(
     f"""
-    <div class="app-hero">
-      <div class="app-pill">
-        <span>📄 PDF QA</span>
+    <div class="cd-hero">
+      <div class="cd-pill">
+        <span>📄 CodeDocMate PDF Lite</span>
         <span>local · no API</span>
       </div>
-      <h1 style="margin-top:0.6rem; margin-bottom:0.3rem; font-size:1.8rem;">
-        PDF question–answer interface
+      <h1 style="margin-top:0.6rem; margin-bottom:0.3rem; font-size:1.9rem;">
+        PDF understanding and summarization interface
       </h1>
+      <p style="margin:0; font-size:0.95rem; color:#e5e7eb;">
+        Upload a PDF, index its text and ask questions to obtain short, focused summaries
+        of the most relevant parts of the document.
+      </p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-c1, c2, c3 = st.columns(3)
-with c1:
+m1, m2, m3 = st.columns(3)
+with m1:
     st.markdown(
         f"""
-        <div class="app-metric">
-          <h3>Pages</h3>
+        <div class="cd-metric">
+          <h3>Pages indexed</h3>
           <span>{n_pages}</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
-with c2:
+with m2:
     st.markdown(
         f"""
-        <div class="app-metric">
+        <div class="cd-metric">
           <h3>Text chunks</h3>
           <span>{n_chunks}</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
-with c3:
+with m3:
     st.markdown(
         f"""
-        <div class="app-metric">
-          <h3>Document</h3>
+        <div class="cd-metric">
+          <h3>Active document</h3>
           <span>{doc_name}</span>
         </div>
         """,
@@ -289,32 +327,36 @@ with c3:
 
 st.markdown("")
 
+# --------------------- Tabs ---------------------
+
 tab_overview, tab_qna, tab_explorer = st.tabs(
-    ["Overview", "Q&A", "Pages"]
+    ["Overview", "PDF & Q&A", "Explorer"]
 )
 
+# Overview tab
 with tab_overview:
-    st.markdown('<div class="app-section">', unsafe_allow_html=True)
+    st.markdown('<div class="cd-section">', unsafe_allow_html=True)
     st.subheader("Overview", anchor=False)
     st.markdown(
         """
-        This interface indexes PDF text locally and answers questions
-        by selecting relevant sentences from the document.
+        This application builds a local TF-IDF index of the PDF text and
+        answers questions by selecting and combining the most relevant sentences.
+        No external APIs or language models are used.
         """
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
+# PDF & Q&A tab
 with tab_qna:
-    st.markdown('<div class="app-section">', unsafe_allow_html=True)
-    st.subheader("PDF and question", anchor=False)
+    st.markdown('<div class="cd-section">', unsafe_allow_html=True)
+    st.subheader("PDF & question", anchor=False)
 
-    col_left, col_right = st.columns([1.0, 1.2])
+    left, right = st.columns([1.05, 1.25])
 
-    with col_left:
+    with left:
         uploaded_pdf = st.file_uploader("PDF", type=["pdf"])
-        name = uploaded_pdf.name if uploaded_pdf is not None else "document.pdf"
-
-        doc_name_input = st.text_input("Name", value=name)
+        default_name = uploaded_pdf.name if uploaded_pdf is not None else "document.pdf"
+        doc_name_input = st.text_input("Name", value=default_name)
 
         if uploaded_pdf is not None and doc_name_input:
             if st.button("Index PDF"):
@@ -322,34 +364,35 @@ with tab_qna:
                     index = build_document_index(uploaded_pdf, doc_name_input)
                     st.session_state.doc_index = index
                     st.success(
-                        f"Indexed {index.n_pages} pages."
+                        f"Indexed {index.n_pages} pages and {len(index.chunks)} text chunks."
                     )
                 except Exception as e:
                     st.error(f"Indexing error: {e}")
 
-    with col_right:
+    with right:
         if st.session_state.doc_index is None:
             st.info("No document indexed.")
         else:
             index = st.session_state.doc_index  # type: ignore
             query = st.text_area("Question")
-            k = st.slider("Pages to use", 1, 5, 3)
+            k = st.slider("Number of pages to consider", 1, 5, 3)
 
-            if st.button("Answer"):
+            if st.button("Get answer"):
                 results = retrieve_top_k(index, query, k=k)
-                explanation_md = build_explanation(results, query)
-                st.markdown(explanation_md)
+                answer_md = build_answer(results, query)
+                st.markdown(answer_md)
 
-                with st.expander("Selected pages (raw text)", expanded=False):
-                    for i, (ch, score) in enumerate(results, start=1):
-                        st.markdown(f"#### Page {ch.page_num} · score={score:.3f}")
-                        st.text(ch.text)
+                with st.expander("Relevant raw text", expanded=False):
+                    for i, (chunk, score) in enumerate(results, start=1):
+                        st.markdown(f"#### Page {chunk.page_num} · score={score:.3f}")
+                        st.text(chunk.text)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+# Explorer tab
 with tab_explorer:
-    st.markdown('<div class="app-section">', unsafe_allow_html=True)
-    st.subheader("Pages", anchor=False)
+    st.markdown('<div class="cd-section">', unsafe_allow_html=True)
+    st.subheader("Explorer", anchor=False)
 
     if st.session_state.doc_index is None:
         st.info("No document indexed.")
@@ -365,5 +408,6 @@ with tab_explorer:
                     break
 
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 
