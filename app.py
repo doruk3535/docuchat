@@ -1,4 +1,3 @@
-
 """
 DocuChat Enterprise Edition
 ---------------------------
@@ -520,11 +519,11 @@ def render_sidebar() -> Tuple[int, int, int, bool]:
         with col1:
             if st.button("Clear Chat", use_container_width=True):
                 SessionManager.clear_history()
-                st.experimental_rerun()
+                st.rerun()
         with col2:
             if st.button("Reset All", use_container_width=True):
                 st.session_state.clear()
-                st.experimental_rerun()
+                st.rerun()
 
         st.divider()
         with st.expander("System Logs", expanded=False):
@@ -634,7 +633,7 @@ def render_file_upload_area(chunk_size: int, overlap: int) -> None:
                         f"Successfully indexed {len(st.session_state.all_chunks)} chunks!"
                     )
                     time.sleep(1)
-                    st.experimental_rerun()
+                    st.rerun()
 
             progress_bar.empty()
     else:
@@ -665,7 +664,7 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
 
     if prompt:
         SessionManager.add_message("user", prompt)
-        st.experimental_rerun()
+        st.rerun()
 
     if (
         st.session_state.chat_history
@@ -697,7 +696,7 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
                     )
                 response_html = f"<p><b>Summary:</b> {summary_text}</p>"
                 SessionManager.add_message("assistant", response_html)
-                st.experimental_rerun()
+                st.rerun()
 
             base_for_summary = filtered_results or results
             summary_text = build_summary(base_for_summary, last_query, max_sentences=4)
@@ -739,7 +738,7 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
                 """
 
             SessionManager.add_message("assistant", response_html)
-            st.experimental_rerun()
+            st.rerun()
 
 
 # ==============================================================================
@@ -772,5 +771,6 @@ def main() -> None:
 
 
 main()
+
 
 
