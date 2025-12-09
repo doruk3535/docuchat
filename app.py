@@ -231,7 +231,6 @@ class DocumentIngestor:
     ) -> List[DocumentChunk]:
         chunks: List[DocumentChunk] = []
         try:
-            # Streamlit UploadedFile yeniden okunabilir olsun diye BytesIO ile sarıyoruz
             pdf_bytes = file_obj.read()
             pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
             file_name = file_obj.name
@@ -367,6 +366,65 @@ class VectorDatabase:
         texts = [c.text[:50] + "..." for c in self.chunks_map.values()]
         sources = [c.source_file for c in self.chunks_map.values()]
         return np.array(embeddings), texts, sources
+
+
+# ==============================================================================
+# 4.5 SUMMARIZATION UTILITIES (NEW)
+# ==============================================================================
+
+
+def split_sentences(text: str) -> List[str]:
+    text = re.sub(r"\s+", " ", text)
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def build_summary(
+    results: List[SearchResult],
+    query: str,
+    max_sentences: int = 4,
+) -> str:
+    if not results:
+        return ""
+
+    q_tokens = [t.lower() for t in re.findall(r"\w+", query) if len(t) >= 3]
+
+    all_sentences: List[Tuple[float, int, str]] = []
+    global_pos = 0
+
+    relevance_weight = {"HIGH": 1.0, "MEDIUM": 0.7, "LOW": 0.4}
+
+    for rank, res in enumerate(results):
+        sentences = split_sentences(res.chunk.text)
+        for idx_s, s in enumerate(sentences):
+            s_low = s.lower()
+            overlap = sum(s_low.count(tok) for tok in q_tokens) if q_tokens else 0
+            rel_w = relevance_weight.get(res.relevance_label, 0.5)
+            pos_w = 1.0 / (1.0 + idx_s)
+            rank_w = 1.0 / (1.0 + rank)
+            score = overlap + 0.4 * rel_w + 0.2 * pos_w + 0.2 * rank_w
+            all_sentences.append((score, global_pos, s))
+            global_pos += 1
+
+    if not all_sentences:
+        return ""
+
+    all_sentences.sort(key=lambda x: x[0], reverse=True)
+    candidates = all_sentences[: max_sentences * 3]
+
+    ordered = sorted(candidates, key=lambda x: x[1])
+    summary_sentences: List[str] = []
+    used = set()
+
+    for _, _, s in ordered:
+        if s in used:
+            continue
+        summary_sentences.append(s)
+        used.add(s)
+        if len(summary_sentences) >= max_sentences:
+            break
+
+    return " ".join(summary_sentences)
 
 
 # ==============================================================================
@@ -540,7 +598,6 @@ def render_file_upload_area(chunk_size: int, overlap: int) -> None:
         f for f in uploaded_files if f.name not in st.session_state.processed_files
     ]
 
-    # Bütün dosyalardan gelen chunkları burada toplayacağız
     all_chunks: List[DocumentChunk] = []
 
     if new_files:
@@ -555,7 +612,6 @@ def render_file_upload_area(chunk_size: int, overlap: int) -> None:
                     (i + 1) / len(new_files), text=f"Processed {file.name}"
                 )
 
-            # Daha önce işlenenler + yeni işlenenler
             if "all_chunks" in st.session_state:
                 st.session_state.all_chunks.extend(all_chunks)
             else:
@@ -617,50 +673,67 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
             time.sleep(0.3)
             results = st.session_state.db.query(last_query, top_k=top_k)
 
-            response_html = ""
-            found_valid_result = False
-
-            if not results:
-                response_html = (
-                    "<i>No relevant information found in the provided documents.</i>"
-                )
+            # Apply strict mode filtering for LOW relevance
+            if strict_mode:
+                filtered_results = [
+                    r for r in results if r.relevance_label != "LOW"
+                ]
             else:
-                response_html += (
-                    f"<div style='margin-bottom:10px;'><b>Found "
-                    f"{len(results)} references:</b></div>"
+                filtered_results = results
+
+            if not results or (strict_mode and not filtered_results):
+                if not results:
+                    summary_text = (
+                        "No relevant information found in the provided documents."
+                    )
+                else:
+                    summary_text = (
+                        "Matches were found but filtered out in strict mode. "
+                        "Try rephrasing the question or disabling strict mode."
+                    )
+                response_html = f"<p><b>Summary:</b> {summary_text}</p>"
+                SessionManager.add_message("assistant", response_html)
+                st.experimental_rerun()
+
+            # Use filtered set for summary, but fall back to full results if empty
+            base_for_summary = filtered_results or results
+            summary_text = build_summary(base_for_summary, last_query, max_sentences=4)
+            if not summary_text:
+                summary_text = (
+                    "A compact summary could not be created from the available text."
                 )
 
-                for res in results:
-                    if strict_mode and res.relevance_label == "LOW":
-                        continue
+            response_html = ""
+            response_html += f"<p><b>Summary:</b> {summary_text}</p>"
+            response_html += "<hr>"
+            response_html += "<div><b>Relevant sources:</b></div>"
 
-                    found_valid_result = True
+            for res in base_for_summary:
+                if strict_mode and res.relevance_label == "LOW":
+                    continue
 
-                    if res.relevance_label == "HIGH":
-                        color = "#16a34a"
-                    elif res.relevance_label == "MEDIUM":
-                        color = "#ca8a04"
-                    else:
-                        color = "#dc2626"
+                if res.relevance_label == "HIGH":
+                    color = "#16a34a"
+                elif res.relevance_label == "MEDIUM":
+                    color = "#ca8a04"
+                else:
+                    color = "#dc2626"
 
-                    response_html += f"""
-                    <div style="border-left: 5px solid {color}; padding-left: 15px; margin-bottom: 20px; background: #fff; padding: 15px; border-radius: 5px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-                        <div class="source-metadata">
-                            📄 {res.chunk.source_file} | Page {res.chunk.page_number} | 
-                            <span style="color:{color}; font-weight:bold;">{res.relevance_label} CONFIDENCE ({res.score:.3f})</span>
-                        </div>
-                        <div class="source-content">
-                            "{res.chunk.text}"
-                        </div>
+                snippet = res.chunk.text.strip()
+                if len(snippet) > 400:
+                    snippet = snippet[:400].rsplit(" ", 1)[0] + "..."
+
+                response_html += f"""
+                <div style="border-left: 5px solid {color}; padding-left: 15px; margin-top: 12px; margin-bottom: 16px; background: #fff; padding: 12px; border-radius: 5px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                    <div class="source-metadata">
+                        📄 {res.chunk.source_file} | Page {res.chunk.page_number} | 
+                        <span style="color:{color}; font-weight:bold;">{res.relevance_label} ({res.score:.3f})</span>
                     </div>
-                    """
-
-                if strict_mode and not found_valid_result:
-                    response_html = (
-                        "<i>Matching results were found but filtered out due to low "
-                        "relevance (Strict Mode Active). Try rephrasing your question "
-                        "or disabling Strict Mode.</i>"
-                    )
+                    <div class="source-content">
+                        {snippet}
+                    </div>
+                </div>
+                """
 
             SessionManager.add_message("assistant", response_html)
             st.experimental_rerun()
@@ -696,4 +769,3 @@ def main() -> None:
 
 
 main()
-
