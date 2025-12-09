@@ -1,3 +1,4 @@
+
 """
 DocuChat Enterprise Edition
 ---------------------------
@@ -80,7 +81,7 @@ if "sys_logger" not in st.session_state:
 
 logger: SystemLogger = st.session_state.sys_logger
 
-# Custom CSS for Professional Look
+# Custom CSS for Professional Look (sidebar koyu gri + chat balonları)
 st.markdown(
     """
 <style>
@@ -135,8 +136,17 @@ st.markdown(
         font-size: 1.5rem;
         color: #2563eb;
     }
+    /* Sidebar koyu gri */
     section[data-testid="stSidebar"] {
-        background-color: #f1f5f9;
+        background-color: #111827;
+        color: #e5e7eb;
+    }
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] span {
+        color: #e5e7eb !important;
     }
 </style>
 """,
@@ -188,9 +198,6 @@ class TextProcessor:
 
     @staticmethod
     def clean_text(text: str) -> str:
-        """
-        Applies a pipeline of cleaning operations to raw text.
-        """
         if not text:
             return ""
 
@@ -369,7 +376,7 @@ class VectorDatabase:
 
 
 # ==============================================================================
-# 4.5 SUMMARIZATION UTILITIES (NEW)
+# 4.5 SUMMARIZATION UTILITIES
 # ==============================================================================
 
 
@@ -475,10 +482,7 @@ class SessionManager:
 
 def render_sidebar() -> Tuple[int, int, int, bool]:
     with st.sidebar:
-        st.image(
-            "https://cdn-icons-png.flaticon.com/512/9626/9626620.png",
-            width=80,
-        )
+        # Takvim resmi kaldırıldı
         st.title("System Control")
         st.caption(f"v3.5.0 | {datetime.now().strftime('%Y-%m-%d')}")
 
@@ -673,7 +677,7 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
             time.sleep(0.3)
             results = st.session_state.db.query(last_query, top_k=top_k)
 
-            # Apply strict mode filtering for LOW relevance
+            # Strict mode: LOW'ları filtrele
             if strict_mode:
                 filtered_results = [
                     r for r in results if r.relevance_label != "LOW"
@@ -695,7 +699,6 @@ def render_chat_interface(top_k: int, strict_mode: bool) -> None:
                 SessionManager.add_message("assistant", response_html)
                 st.experimental_rerun()
 
-            # Use filtered set for summary, but fall back to full results if empty
             base_for_summary = filtered_results or results
             summary_text = build_summary(base_for_summary, last_query, max_sentences=4)
             if not summary_text:
@@ -769,3 +772,5 @@ def main() -> None:
 
 
 main()
+
+
