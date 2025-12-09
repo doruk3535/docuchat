@@ -1,9 +1,5 @@
 streamlit
-PyPDF2
-sentence-transformers
-faiss-cpu
 numpy
-pandas
-plotly
 scikit-learn
+PyPDF2
 
